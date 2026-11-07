@@ -1,0 +1,15 @@
+[package]
+name = "oc-wire"
+description = "OpenChat relay wire types shared by clients and relays"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.22"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

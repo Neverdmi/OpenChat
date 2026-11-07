@@ -214,18 +214,26 @@ frame = len_le(2) || payload || random_padding
 ### 10.1 Протокол релея
 Минимальный публичный API (WebSocket, JSON):
 ```
-POST /publish   { id, mailbox_pk, created_at, expires_at, payload_b64, sig? }
-GET  /subscribe?mailbox=<pk>&since=<ts>   (WebSocket stream)
+WS   /ws?mailbox=<hex>&since=<ts>
+     client -> {"type":"publish","event":{...}}   // можно и без mailbox
+     client -> {"type":"ping"}
+     relay  -> {"type":"event","event":{...}}
+     relay  -> {"type":"published"} | {"type":"pong"} | {"type":"error","message":"..."}
+
+POST /publish   { mailbox, created_at, expires_at, payload_b64 }   // совместимость
 GET  /health
 ```
-- Релей не требует аккаунта и не хранит IP в логах (рекомендуется `--no-access-log`).
-- Хранит только `mailbox_pk`, `created_at`, `expires_at`, `payload` (шифротекст).
-- TTL по умолчанию 7 дней, лимит на ящик — 100 сообщений.
+- Основной путь клиента — один WebSocket: подписка на ящик, публикация и ping.
+- `POST /publish` оставлен для простых интеграций и отладки.
+- Релей не требует аккаунта и не хранит IP в логах (по умолчанию access-log отсутствует).
+- Хранит только `mailbox`, `created_at`, `expires_at`, `payload` (шифротекст).
+- TTL по умолчанию 7 дней, лимит на ящик — 100 сообщений, payload — 64 KiB.
 - Никакой валидации содержимого (оно непрозрачно).
 - Опционально: `.onion`-адрес через Tor onion service.
 
 ### 10.2 Пул по умолчанию
 - Курируемый список в репозитории (`relays/default.json`), подписан ключом проекта.
+- Сейчас список пуст: публичные релеи будут добавлены после первого развёртывания.
 - В репозитории — `oc-relay`, чтобы сообщество/любой человек мог поднять свой.
 - Пользователь может добавить любой совместимый релей; список экспортируется/импортируется.
 
@@ -274,7 +282,7 @@ cargo test
 |---|---|---|
 | P0 | Спека, модель угроз, wire format | готово |
 | P1 | `oc-core`: identity, PQ, X3DH, sealed sender, кадры, ящики, ratchet + тесты | готово (25 тестов) |
-| P2 | `oc-transport`: Carrier trait, WebSocket-релей, пул, health-check | — |
+| P2 | `oc-transport`: Carrier trait, WebSocket-релей, пул, health-check | готово (41 тест суммарно) |
 | P3 | `oc-client` + CLI: invite → handshake → текст 1:1, offline-доставка | — |
 | P4 | `oc-relay`, default pool, manifest, MQTT/WebRTC-фолбэки | — |
 | P5 | Desktop UI (Linux gnu/musl + Windows), упаковка | — |

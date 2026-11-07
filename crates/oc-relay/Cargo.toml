@@ -1,0 +1,21 @@
+[package]
+name = "oc-relay"
+description = "OpenChat relay: dumb encrypted store-and-forward server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+hex = "0.4"
+oc-wire = { path = "../oc-wire" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+
+[dev-dependencies]
+oc-transport = { path = "../oc-transport" }
+tokio = { version = "1", features = ["full"] }

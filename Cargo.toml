@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/oc-core"]
+members = [
+    "crates/oc-core",
+    "crates/oc-wire",
+    "crates/oc-transport",
+    "crates/oc-relay",
+]
 
 [workspace.package]
 version = "0.1.0"
