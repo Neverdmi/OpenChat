@@ -214,7 +214,10 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TuiApp) {
     // Header: title, status, invite, outbox.
     let header_text = vec![
         Line::from(vec![
-            Span::styled("OpenChat", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("OpenChat v{}", env!("CARGO_PKG_VERSION")),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw(format!("  outbox: {}  {}", app.outbox_len, app.status)),
         ]),
         Line::from(format!(

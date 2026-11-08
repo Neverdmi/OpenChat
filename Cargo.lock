@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "oc-cli"
-version = "0.1.0"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "clap",
@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "oc-client"
-version = "0.1.0"
+version = "0.1.19"
 dependencies = [
  "argon2",
  "base64",
@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "oc-core"
-version = "0.1.0"
+version = "0.1.19"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "oc-relay"
-version = "0.1.0"
+version = "0.1.19"
 dependencies = [
  "axum",
  "clap",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "oc-transport"
-version = "0.1.0"
+version = "0.1.19"
 dependencies = [
  "async-trait",
  "base64",
@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "oc-tui"
-version = "0.1.0"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "base64",
@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "oc-wire"
-version = "0.1.0"
+version = "0.1.19"
 dependencies = [
  "base64",
  "hex",
