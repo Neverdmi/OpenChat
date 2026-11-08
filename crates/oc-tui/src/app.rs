@@ -366,6 +366,13 @@ impl TuiApp {
     /// Try to unlock the state and start the worker thread.
     pub fn unlock(&mut self) {
         let home = PathBuf::from(self.home.trim());
+        if !StateStore::exists(&home) {
+            self.error = Some(format!(
+                "no state at {} — create one first with: oc init",
+                StateStore::path_in(&home).display()
+            ));
+            return;
+        }
         let result = (|| -> Result<Worker, String> {
             let store = StateStore::open(&home, &self.passphrase)
                 .map_err(|error| format!("open state: {error:#}"))?;

@@ -299,7 +299,7 @@ fn draw_unlock(frame: &mut ratatui::Frame, app: &TuiApp) {
 
     let footer = match &app.error {
         Some(error) => Span::styled(error.clone(), Style::default().fg(Color::Red)),
-        None => Span::raw("No state yet? Create one first with: oc init --relay <url>"),
+        None => Span::raw("First run? Create state first: oc init (you invent the passphrase there)"),
     };
     frame.render_widget(Paragraph::new(Line::from(footer)), chunks[3]);
 }
