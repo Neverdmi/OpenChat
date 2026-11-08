@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 crossterm = "0.29"
 hex = "0.4"
 oc-cli = { path = "../oc-cli" }

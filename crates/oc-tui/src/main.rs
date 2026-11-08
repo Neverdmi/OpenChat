@@ -78,6 +78,20 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::
         app.poll_events();
         terminal.draw(|frame| draw(frame, &mut app))?;
 
+        // Clipboard copy via OSC 52 (works in most modern terminals and
+        // avoids error-prone mouse selection of the long invite text).
+        if app.copy_requested {
+            app.copy_requested = false;
+            use base64::Engine;
+            let encoded =
+                base64::engine::general_purpose::STANDARD.encode(app.invite.as_bytes());
+            execute!(
+                terminal.backend_mut(),
+                crossterm::style::Print(format!("\x1b]52;c;{encoded}\x07"))
+            )?;
+            app.status = "invite copied to clipboard".to_string();
+        }
+
         if app.should_quit {
             break;
         }
@@ -148,9 +162,17 @@ fn handle_key(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) {
         return;
     }
 
-    // Esc closes the invite panel.
-    if app.show_invite && code == KeyCode::Esc {
-        app.show_invite = false;
+    // Invite panel keys: Esc closes, C copies (handled in the event loop).
+    if app.show_invite {
+        match code {
+            KeyCode::Esc => {
+                app.show_invite = false;
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                app.copy_requested = true;
+            }
+            _ => {}
+        }
         return;
     }
 
@@ -195,7 +217,10 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TuiApp) {
             Span::styled("OpenChat", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!("  outbox: {}  {}", app.outbox_len, app.status)),
         ]),
-        Line::from(format!("invite: {}", app.invite)),
+        Line::from(format!(
+            "you: {}  ·  /invite for the full link",
+            app.own_short
+        )),
     ];
     let header = Paragraph::new(header_text).block(Block::default().borders(Borders::ALL));
     frame.render_widget(header, chunks[0]);
@@ -230,7 +255,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TuiApp) {
             Line::from(""),
             Line::from(app.invite.clone()),
             Line::from(""),
-            Line::from("Esc to close"),
+            Line::from("C copy to clipboard · Esc to close"),
         ];
         let panel = Paragraph::new(invite_text)
             .wrap(ratatui::widgets::Wrap { trim: false })

@@ -3,7 +3,7 @@
 Обновлено: 2026-11-08
 Ветка: `main`
 Статус: P4 почти готов (свой релей не развёрнут; default.json заполнен публичными MQTT-брокерами); P5 — CLI и TUI готовы (GUI удалён), осталась упаковка
-Тестов: 92 (+11 oc-tui, вне default-members)
+Тестов: 93 (+11 oc-tui, вне default-members)
 
 > Этот файл — точка входа для ИИ-агентов. Прочитай его и `SPEC.md`
 > перед любыми изменениями. После каждого завершённого этапа обновляй
@@ -114,6 +114,8 @@ openchat/
 - `store.rs` — `state.enc`: magic || Argon2id salt || nonce || ciphertext.
   Argon2id `m=19456,t=2,p=1`; запись `0600`, атомарная через rename.
 - `invite.rs` — `openchat://v1/<peer_b32>/<bundle_b64>[/<relays_b64>]`.
+  Встроенные дефолтные релеи в hints не кладутся (уже есть у всех) —
+  invite ~1.9 KB вместо ~2.9 KB.
 - `message.rs` — text body (`msg_id`, timestamp, UTF-8) и inner envelope
   (`kind=1` handshake, `kind=2` ratchet text).
 - `client.rs` — `Client::{create,open,invite,add_invite,send_text,listen_once,
@@ -201,7 +203,7 @@ cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Ожидаемо: 92 теста. Ручная проверка релея:
+Ожидаемо: 93 теста. Ручная проверка релея:
 
 ```bash
 cargo run -p oc-relay -- --listen 127.0.0.1:8080

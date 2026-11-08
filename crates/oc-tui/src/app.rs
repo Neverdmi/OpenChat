@@ -46,6 +46,8 @@ pub enum UiEvent {
         contacts: Vec<ContactView>,
         /// Our invite link.
         invite: String,
+        /// Our own short peer id.
+        own_short: String,
         /// Outgoing events still waiting for a relay.
         outbox_len: usize,
     },
@@ -193,8 +195,12 @@ pub struct TuiApp {
     pub contacts: Vec<ContactView>,
     /// Our invite link from the last snapshot.
     pub invite: String,
+    /// Our own short peer id.
+    pub own_short: String,
     /// Outbox size from the last snapshot.
     pub outbox_len: usize,
+    /// Set by the UI when the invite should be copied to the clipboard.
+    pub copy_requested: bool,
     /// Index into `contacts` of the selected peer.
     pub selected: usize,
     /// Conversation lines (session only).
@@ -228,6 +234,8 @@ impl TuiApp {
             worker: None,
             contacts: Vec::new(),
             invite: String::new(),
+            own_short: String::new(),
+            copy_requested: false,
             outbox_len: 0,
             selected: 0,
             lines: Vec::new(),
@@ -319,10 +327,12 @@ impl TuiApp {
             UiEvent::Snapshot {
                 contacts,
                 invite,
+                own_short,
                 outbox_len,
             } => {
                 self.contacts = contacts;
                 self.invite = invite;
+                self.own_short = own_short;
                 self.outbox_len = outbox_len;
                 if self.selected >= self.contacts.len() {
                     self.selected = self.contacts.len().saturating_sub(1);
@@ -548,6 +558,10 @@ fn snapshot(client: &Client) -> UiEvent {
             })
             .collect(),
         invite: client.invite().unwrap_or_default(),
+        own_short: client
+            .peer_id()
+            .map(|peer_id| short_peer_id(&peer_id))
+            .unwrap_or_default(),
         outbox_len: client.outbox().len(),
     }
 }

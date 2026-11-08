@@ -1359,6 +1359,7 @@ name = "oc-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "crossterm 0.29.0",
  "hex",
  "oc-cli",

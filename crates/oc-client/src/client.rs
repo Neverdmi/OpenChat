@@ -168,8 +168,12 @@ impl Client {
     }
 
     /// Build the invite link for this identity.
+    ///
+    /// Built-in default relays are not embedded as hints: every client
+    /// already has them, so they would only bloat the link by hundreds
+    /// of characters. Only user-added relays are carried in the invite.
     pub fn invite(&self) -> Result<String> {
-        let invite = Invite::new(self.state.bundle()?, self.state.relays.clone())?;
+        let invite = Invite::new(self.state.bundle()?, invite_hints(&self.state.relays))?;
         Ok(invite.encode())
     }
 
@@ -780,6 +784,17 @@ impl Client {
     }
 }
 
+/// Relay hints worth embedding in an invite: everything except the
+/// built-in defaults every client already knows.
+fn invite_hints(relays: &[String]) -> Vec<String> {
+    let defaults = oc_transport::relay_list::default_relays().unwrap_or_default();
+    relays
+        .iter()
+        .filter(|relay| !defaults.contains(relay))
+        .cloned()
+        .collect()
+}
+
 /// Pick an unused mailbox slot for `epoch`, resetting the mask when exhausted.
 fn pick_slot(contact: &mut ContactRecord, epoch: u32) -> u32 {
     if contact.slot_epoch != epoch {
@@ -842,6 +857,18 @@ mod tests {
             slot_epoch: 0,
             slot_mask: 0,
         }
+    }
+
+    #[test]
+    fn invite_hints_skip_builtin_defaults() {
+        let defaults = oc_transport::relay_list::default_relays().unwrap();
+        assert!(!defaults.is_empty(), "default list should be filled");
+        // All-default relays produce no hints (short invite).
+        assert!(invite_hints(&defaults).is_empty());
+        // Custom relays are kept.
+        let mut mixed = defaults.clone();
+        mixed.push("https://relay.example".to_string());
+        assert_eq!(invite_hints(&mixed), vec!["https://relay.example"]);
     }
 
     #[test]
