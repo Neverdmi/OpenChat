@@ -6,12 +6,18 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use oc_client::invite::{peer_id_base32, short_peer_id};
-use oc_client::{Client, Invite, StateStore};
+use oc_client::{Client, Invite, ListenOutcome, StateStore};
 use oc_transport::RelayPool;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
-#[command(name = "oc", about = "OpenChat command-line client")]
+#[command(
+    name = "oc",
+    version,
+    about = "OpenChat command-line client (text only)",
+    after_help = "Quick start:\n  oc init --relay https://relay.example\n  oc invite\n  oc add <invite>\n  oc chat <peer-prefix>     # interactive: receive + send in one process\n  oc send <peer> \"hello\"    # or one-shot commands\n  oc listen                 # receive only, forever\n  oc contacts / oc relays --check / oc outbox / oc flush\n\nChat commands: /help, /peer <prefix>, /quit. Plaintext history is never\nstored: messages are printed when they arrive (or replay from the relay)."
+)]
 struct Args {
     /// Directory holding the encrypted state file.
     #[arg(
@@ -56,6 +62,19 @@ enum Command {
 
         /// Message text (quote it if it contains spaces).
         text: String,
+
+        /// Number of relays to publish to.
+        #[arg(long, default_value_t = 3)]
+        fanout: usize,
+    },
+
+    /// Interactive chat: receive and send text in one process.
+    ///
+    /// Without a peer argument it starts in receive-only mode; switch
+    /// conversation with `/peer <prefix>`. Type `/help` inside for commands.
+    Chat {
+        /// Peer id (full or unique prefix, base32 or hex).
+        peer: Option<String>,
 
         /// Number of relays to publish to.
         #[arg(long, default_value_t = 3)]
@@ -169,6 +188,12 @@ async fn run() -> Result<()> {
             );
             Ok(())
         }
+        Command::Chat { peer, fanout } => {
+            let passphrase = passphrase(false)?;
+            let mut client = open_client(&args.home, &passphrase)?;
+            let pool = build_pool(client.relays())?;
+            run_chat(&mut client, &pool, peer, fanout).await
+        }
         Command::Listen { once, idle, since } => {
             let passphrase = passphrase(false)?;
             let mut client = open_client(&args.home, &passphrase)?;
@@ -178,19 +203,7 @@ async fn run() -> Result<()> {
                 let outcome = client
                     .listen_once(&pool, Duration::from_secs(idle.max(1)), since)
                     .await?;
-                for peer_id in &outcome.added_contacts {
-                    println!("new contact: {}", short_peer_id(peer_id));
-                }
-                for message in &outcome.messages {
-                    println!("{}: {}", short_peer_id(&message.peer_id), message.text);
-                }
-                for ack in &outcome.acks {
-                    println!(
-                        "ack: {} delivered {}",
-                        short_peer_id(&ack.peer_id),
-                        hex::encode(ack.acked_msg_id)
-                    );
-                }
+                print_outcome(&outcome);
                 if once {
                     break;
                 }
@@ -277,6 +290,141 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+/// One parsed line of interactive chat input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatAction {
+    /// Blank line.
+    Empty,
+    /// Leave the chat.
+    Quit,
+    /// Show commands.
+    Help,
+    /// Switch conversation to the given peer prefix.
+    Peer(String),
+    /// Unknown slash-command (first word).
+    Unknown(String),
+    /// Text to send to the current peer.
+    Text(String),
+}
+
+/// Parse one line typed in `oc chat`.
+fn parse_chat_line(line: &str) -> ChatAction {
+    let line = line.trim();
+    if line.is_empty() {
+        return ChatAction::Empty;
+    }
+    if line == "/quit" || line == "/exit" {
+        return ChatAction::Quit;
+    }
+    if line == "/help" {
+        return ChatAction::Help;
+    }
+    if let Some(rest) = line.strip_prefix("/peer ") {
+        let prefix = rest.trim();
+        if !prefix.is_empty() {
+            return ChatAction::Peer(prefix.to_string());
+        }
+    }
+    if let Some(command) = line.strip_prefix('/') {
+        let first_word = command.split_whitespace().next().unwrap_or("");
+        return ChatAction::Unknown(format!("/{first_word}"));
+    }
+    ChatAction::Text(line.to_string())
+}
+
+/// Interactive chat loop: drain incoming events, then read one input line.
+///
+/// Incoming events are polled with a 1-second idle window and input with a
+/// 1-second timeout, alternating. That keeps a single `Client` (which is
+/// not `Clone`) usable for both directions without threads; messages are
+/// printed on arrival, outgoing text goes through the usual outbox path,
+/// so a relay outage queues instead of losing the line.
+async fn run_chat(
+    client: &mut Client,
+    pool: &RelayPool,
+    peer: Option<String>,
+    fanout: usize,
+) -> Result<()> {
+    let mut current: Option<[u8; 32]> = match peer {
+        Some(argument) => Some(resolve_peer(client, &argument)?),
+        None => None,
+    };
+
+    println!("OpenChat chat (text only)");
+    match current {
+        Some(peer_id) => println!("talking to {}", short_peer_id(&peer_id)),
+        None => println!("no peer selected yet; use /peer <prefix> to pick one"),
+    }
+    println!("commands: /help  /peer <prefix>  /quit");
+
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        match client.listen_once(pool, Duration::from_secs(1), 0).await {
+            Ok(outcome) => print_outcome(&outcome),
+            Err(error) => eprintln!("listen error: {error:#}"),
+        }
+
+        let line = match tokio::time::timeout(Duration::from_secs(1), lines.next_line()).await {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
+                eprintln!("input error: {error}");
+                break;
+            }
+            Err(_) => continue,
+        };
+
+        match parse_chat_line(&line) {
+            ChatAction::Empty => {}
+            ChatAction::Quit => break,
+            ChatAction::Help => {
+                println!("commands: /help  /peer <prefix>  /quit\njust type text to send it");
+            }
+            ChatAction::Peer(prefix) => match resolve_peer(client, &prefix) {
+                Ok(peer_id) => {
+                    current = Some(peer_id);
+                    println!("talking to {}", short_peer_id(&peer_id));
+                }
+                Err(error) => eprintln!("error: {error:#}"),
+            },
+            ChatAction::Unknown(command) => {
+                eprintln!("unknown command: {command} (try /help)");
+            }
+            ChatAction::Text(text) => {
+                let Some(peer_id) = current else {
+                    eprintln!("no peer selected; use /peer <prefix> first");
+                    continue;
+                };
+                match client.send_text(&peer_id, &text, pool, fanout).await {
+                    Ok(sent) if sent.queued => {
+                        println!("queued (relay unavailable, will retry)");
+                    }
+                    Ok(sent) => println!("sent via {} relay(s)", sent.delivered),
+                    Err(error) => eprintln!("send error: {error:#}"),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Print everything one receive pass produced.
+fn print_outcome(outcome: &ListenOutcome) {
+    for peer_id in &outcome.added_contacts {
+        println!("new contact: {}", short_peer_id(peer_id));
+    }
+    for message in &outcome.messages {
+        println!("{}: {}", short_peer_id(&message.peer_id), message.text);
+    }
+    for ack in &outcome.acks {
+        println!(
+            "ack: {} delivered {}",
+            short_peer_id(&ack.peer_id),
+            hex::encode(ack.acked_msg_id)
+        );
     }
 }
 
@@ -383,4 +531,50 @@ fn default_home() -> PathBuf {
         return PathBuf::from(home).join(".openchat");
     }
     PathBuf::from(".openchat")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_line_parsing() {
+        assert_eq!(parse_chat_line(""), ChatAction::Empty);
+        assert_eq!(parse_chat_line("   "), ChatAction::Empty);
+        assert_eq!(parse_chat_line("/quit"), ChatAction::Quit);
+        assert_eq!(parse_chat_line("/exit"), ChatAction::Quit);
+        assert_eq!(parse_chat_line("/help"), ChatAction::Help);
+        assert_eq!(
+            parse_chat_line("/peer ABCD1234"),
+            ChatAction::Peer("ABCD1234".to_string())
+        );
+        assert_eq!(
+            parse_chat_line("/bogus arg"),
+            ChatAction::Unknown("/bogus".to_string())
+        );
+        assert_eq!(
+            parse_chat_line("hello world"),
+            ChatAction::Text("hello world".to_string())
+        );
+        // Plain text may contain slashes, just not as the first character.
+        assert_eq!(
+            parse_chat_line("a/b testing"),
+            ChatAction::Text("a/b testing".to_string())
+        );
+    }
+
+    #[test]
+    fn chat_command_parses_with_and_without_peer() {
+        let args = Args::try_parse_from(["oc", "chat"]).unwrap();
+        assert!(matches!(args.command, Command::Chat { peer: None, .. }));
+
+        let args = Args::try_parse_from(["oc", "chat", "ABCD1234", "--fanout", "1"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Command::Chat {
+                peer: Some(ref peer),
+                fanout: 1
+            } if peer == "ABCD1234"
+        ));
+    }
 }

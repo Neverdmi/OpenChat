@@ -337,7 +337,7 @@ GET  /health
 
 ### 11.1 Стек
 - Ядро: Rust, `#![forbid(unsafe_code)]`.
-- UI: сначала CLI/TUI (`ratatui`), затем desktop (`egui`/`iced`, один статический бинарник — дружит с musl).
+- UI: сначала CLI (`oc`: одноразовые команды + интерактивный `chat`), потом TUI (`ratatui`) и desktop (`egui`/`iced`, один статический бинарник — дружит с musl).
 - Мобильные позже: `uniffi` → Kotlin/Swift.
 - Крипто: `ed25519-dalek`, `x25519-dalek`, `ml-kem`, `chacha20poly1305`, `hkdf`, `sha2`, `blake2`.
 - Транспорт: `tokio`, `tokio-tungstenite`, `rustls`, `reqwest`/`hyper`.
@@ -395,6 +395,17 @@ magic(8) || salt(16) || nonce(24) || XChaCha20-Poly1305(JSON state)
   backoff 250 ms … 30 s. Ошибка или закрытие одного релея не завершает
   общий поток и не прерывает `listen`.
 
+### 11.5 CLI (`oc`)
+
+- Одноразовые команды: `init`, `invite`, `add`, `send`, `listen`,
+  `contacts`, `flush`, `outbox`, `rotate`, `relays`.
+- `chat [PEER]` — интерактивный режим в одном процессе: входящие события
+  опрашиваются с паузой 1 c, ввод читается построчно (тайм-авт 1 c).
+  Команды внутри: `/help`, `/peer <prefix>`, `/quit`. Текст без `/`
+  отправляется выбранному контакту обычным путём через outbox.
+- История открытым текстом не хранится (в состоянии её нет по дизайну):
+  сообщения печатаются при получении или при replay с релея.
+
 ---
 
 ## 12. Дорожная карта
@@ -406,7 +417,7 @@ magic(8) || salt(16) || nonce(24) || XChaCha20-Poly1305(JSON state)
 | P2 | `oc-transport`: Carrier trait, WebSocket-релей, пул, health-check | готово (41 тест суммарно) |
 | P3 | `oc-client` + CLI: invite → handshake → текст 1:1, offline-доставка | готово (70 тестов суммарно) |
 | P4 | `oc-relay`, default pool, manifest, MQTT/WebRTC-фолбэки | частично: MQTT готов; публичный релей ждёт деплоя, WebRTC — позже |
-| P5 | Desktop UI (Linux gnu/musl + Windows), упаковка | — |
+| P5 | CLI-интерфейс, затем Desktop UI (Linux gnu/musl + Windows), упаковка | частично: интерактивный CLI (`oc chat`) готов; desktop — позже |
 | P6 | Tor-режимы, cover-трафик, аудит, mobile | — |
 
 ---

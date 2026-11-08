@@ -3,8 +3,8 @@
 Анонимный текстовый мессенджер на публичной инфраструктуре.
 
 - Спецификация: [SPEC.md](SPEC.md)
-- Статус: P3 завершён — клиент, CLI, invite → handshake → текст 1:1
-- Тесты: 70
+- Статус: P5 начат — интерактивный CLI; P4 почти готов (ждёт деплоя публичного релея)
+- Тесты: 90
 
 ## Что уже работает
 
@@ -39,7 +39,10 @@
 - Состояние и сессии переживают перезапуск
 
 **CLI (`oc-cli`, бинарник `oc`)**
-- `init`, `invite`, `add`, `send`, `listen`, `contacts`
+- `init`, `invite`, `add`, `send`, `chat`, `listen`, `contacts`, `flush`, `outbox`, `rotate`, `relays`
+- `chat [PEER]` — интерактивный чат: приём и отправка в одном процессе,
+  команды `/help`, `/peer <prefix>`, `/quit`. История открытым текстом
+  не хранится — сообщения печатаются при получении.
 
 ## Сборка и тесты
 
@@ -96,6 +99,15 @@ OPENCHAT_PASSPHRASE='alice-passphrase' ./target/debug/oc --home /tmp/alice liste
 ```
 
 Без `--once` команда `listen` работает постоянно.
+
+Интерактивный режим (приём + отправка в одном окне):
+
+```bash
+OPENCHAT_PASSPHRASE='alice-passphrase' ./target/debug/oc --home /tmp/alice chat "$BOB_ID"
+```
+
+Внутри: текст — отправить, `/peer <prefix>` — сменить собеседника,
+`/help` — справка, `/quit` — выход.
 
 ## Запуск релея
 
