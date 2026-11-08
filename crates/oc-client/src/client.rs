@@ -90,7 +90,11 @@ pub struct ListenOutcome {
 #[derive(Clone)]
 enum MailboxRef {
     Handshake { secret: [u8; 32] },
-    Inbox { peer_id: [u8; 32], secret: [u8; 32] },
+    Inbox {
+        peer_id: [u8; 32],
+        epoch: u32,
+        secret: [u8; 32],
+    },
 }
 
 type SubscriptionMap = HashMap<[u8; 32], MailboxRef>;
@@ -431,14 +435,16 @@ impl Client {
         let _ = self.flush_due_outbox(pool, DEFAULT_FANOUT).await?;
         let mut outcome = ListenOutcome::default();
         let mut pending_acks: Vec<([u8; 32], [u8; 16])> = Vec::new();
+        let mut advanced = false;
 
         loop {
-            let (mailboxes, map) = self.subscriptions()?;
+            let (mailboxes, map, resume) = self.subscriptions()?;
             if mailboxes.is_empty() {
                 break;
             }
 
-            let mut stream = pool.subscribe_all_many(&mailboxes, since).await?;
+            let effective_since = since.max(resume);
+            let mut stream = pool.subscribe_all_many(&mailboxes, effective_since).await?;
             let mut restart = false;
 
             loop {
@@ -449,30 +455,46 @@ impl Client {
                     // non-recoverable error surfaces, rebuild the subscription
                     // instead of failing the whole listen pass.
                     Ok(Some(Err(_))) => break,
-                    Ok(Some(Ok(event))) => match self.process_event(&map, &event)? {
-                        Processed::Ignored => {}
-                        Processed::Message(message) => {
-                            let target = (message.peer_id, message.msg_id);
-                            if !pending_acks.contains(&target) {
-                                pending_acks.push(target);
+                    Ok(Some(Ok(event))) => {
+                        let epoch = match map.get(&event.mailbox) {
+                            Some(MailboxRef::Inbox { epoch, .. }) => Some(*epoch),
+                            _ => None,
+                        };
+                        self.state
+                            .advance_cursor(event.mailbox, epoch, event.created_at);
+                        advanced = true;
+
+                        match self.process_event(&map, &event)? {
+                            Processed::Ignored => {}
+                            Processed::Message(message) => {
+                                let target = (message.peer_id, message.msg_id);
+                                if !pending_acks.contains(&target) {
+                                    pending_acks.push(target);
+                                }
+                                outcome.messages.push(message);
                             }
-                            outcome.messages.push(message);
+                            Processed::Ack(ack) => outcome.acks.push(ack),
+                            Processed::ContactAdded(peer_id) => {
+                                // New contact means new inbox mailboxes: rebuild
+                                // the subscription and replay from the relay.
+                                outcome.added_contacts.push(peer_id);
+                                restart = true;
+                                break;
+                            }
                         }
-                        Processed::Ack(ack) => outcome.acks.push(ack),
-                        Processed::ContactAdded(peer_id) => {
-                            // New contact means new inbox mailboxes: rebuild
-                            // the subscription and replay from the relay.
-                            outcome.added_contacts.push(peer_id);
-                            restart = true;
-                            break;
-                        }
-                    },
+                    }
                 }
             }
 
             if !restart {
                 break;
             }
+        }
+
+        if advanced {
+            let epoch = mailbox::epoch_of(now_unix());
+            self.state.prune_cursors(epoch.saturating_sub(2));
+            self.save()?;
         }
 
         for (peer_id, msg_id) in pending_acks {
@@ -503,9 +525,10 @@ impl Client {
         Ok(())
     }
 
-    fn subscriptions(&self) -> Result<(Vec<[u8; 32]>, SubscriptionMap)> {
+    fn subscriptions(&self) -> Result<(Vec<[u8; 32]>, SubscriptionMap, u64)> {
         let me = self.state.peer_id()?;
         let prekeys = self.state.prekeys()?;
+        let bundle = self.state.bundle()?;
         let mut map = HashMap::new();
 
         let handshake = prekeys.signed_prekey_public();
@@ -515,6 +538,7 @@ impl Client {
                 secret: prekeys.signed_prekey.to_bytes(),
             },
         );
+        let handshake_floor = bundle.created_at;
 
         let epoch = mailbox::epoch_of(now_unix());
         for contact in &self.state.contacts {
@@ -527,6 +551,7 @@ impl Client {
                         public,
                         MailboxRef::Inbox {
                             peer_id: contact.peer_id,
+                            epoch: current,
                             secret: chain.slot_secret(current, index),
                         },
                     );
@@ -534,8 +559,33 @@ impl Client {
             }
         }
 
+        // Replay only what may have been produced after a mailbox or session
+        // existed, then from the newest cursor for mailboxes already seen.
+        // Using the minimum across mailboxes is required because the relay's
+        // `since` is global for the whole subscription.
+        let mut resume = u64::MAX;
+        for (mailbox, reference) in &map {
+            let floor = match reference {
+                MailboxRef::Handshake { .. } => handshake_floor,
+                MailboxRef::Inbox { epoch, peer_id, .. } => {
+                    let epoch_start = u64::from(*epoch) * mailbox::EPOCH_SECONDS;
+                    let contact_start = self
+                        .state
+                        .contact(peer_id)
+                        .map(|contact| contact.created_at)
+                        .unwrap_or(0);
+                    epoch_start.max(contact_start)
+                }
+            };
+            let cursor = self.state.cursor(mailbox).map_or(floor, |value| value.max(floor));
+            resume = resume.min(cursor);
+        }
+        if resume == u64::MAX {
+            resume = 0;
+        }
+
         let mailboxes = map.keys().copied().collect();
-        Ok((mailboxes, map))
+        Ok((mailboxes, map, resume))
     }
 
     fn process_event(
@@ -547,9 +597,9 @@ impl Client {
             Some(MailboxRef::Handshake { secret }) => {
                 self.process_handshake(&secret, &event.payload)
             }
-            Some(MailboxRef::Inbox { peer_id, secret }) => {
-                self.process_text(&peer_id, &secret, &event.payload)
-            }
+            Some(MailboxRef::Inbox {
+                peer_id, secret, ..
+            }) => self.process_text(&peer_id, &secret, &event.payload),
             None => Ok(Processed::Ignored),
         }
     }

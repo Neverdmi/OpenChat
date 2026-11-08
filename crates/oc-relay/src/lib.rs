@@ -136,6 +136,17 @@ impl Relay {
 
     /// Serve until the listener fails, with periodic expiry cleanup.
     pub async fn serve(self, listener: TcpListener) -> std::io::Result<()> {
+        self.serve_until(listener, std::future::pending()).await
+    }
+
+    /// Serve until `shutdown` resolves or the listener fails.
+    ///
+    /// Used by tests and by deployments that need a graceful stop; the
+    /// in-memory queue is lost when the relay stops.
+    pub async fn serve_until<F>(self, listener: TcpListener, shutdown: F) -> std::io::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         let state = self.state.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
@@ -145,7 +156,9 @@ impl Relay {
             }
         });
 
-        axum::serve(listener, self.router()).await
+        axum::serve(listener, self.router())
+            .with_graceful_shutdown(shutdown)
+            .await
     }
 }
 

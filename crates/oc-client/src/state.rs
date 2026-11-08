@@ -23,6 +23,31 @@ pub const SEEN_CAPACITY: usize = 4096;
 pub const OUTBOX_CAPACITY: usize = 1024;
 /// Maximum number of remembered delivery acknowledgements.
 pub const ACK_CAPACITY: usize = 4096;
+/// Maximum number of remembered mailbox replay cursors.
+pub const CURSOR_CAPACITY: usize = 8192;
+
+/// Last event timestamp seen on one mailbox.
+///
+/// The relay only filters by one `since` value, so the client tracks a cursor
+/// per mailbox and subscribes from the oldest one. After a restart this avoids
+/// replaying the whole store while still covering newly opened mailboxes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CursorRecord {
+    /// Mailbox public key.
+    pub mailbox: [u8; 32],
+    /// Day epoch this mailbox belongs to, `None` for the handshake mailbox.
+    #[serde(default)]
+    pub epoch: Option<u32>,
+    /// Newest event timestamp already observed on this mailbox.
+    pub last_created_at: u64,
+}
+
+impl CursorRecord {
+    /// Timestamp to pass to the relay (`since` is exclusive).
+    pub fn resume_since(&self) -> u64 {
+        self.last_created_at.saturating_sub(1)
+    }
+}
 
 /// One outgoing event waiting to be accepted by a relay.
 ///
@@ -143,6 +168,9 @@ pub struct ClientState {
     /// (`hex(peer_id) || hex(msg_id)`).
     #[serde(default)]
     pub acks: VecDeque<String>,
+    /// Per-mailbox replay cursors.
+    #[serde(default)]
+    pub cursors: Vec<CursorRecord>,
 }
 
 impl core::fmt::Debug for ClientState {
@@ -154,6 +182,7 @@ impl core::fmt::Debug for ClientState {
             .field("seen", &self.seen.len())
             .field("outbox", &self.outbox.len())
             .field("acks", &self.acks.len())
+            .field("cursors", &self.cursors.len())
             .finish_non_exhaustive()
     }
 }
@@ -173,6 +202,7 @@ impl ClientState {
             seen: VecDeque::new(),
             outbox: Vec::new(),
             acks: VecDeque::new(),
+            cursors: Vec::new(),
         })
     }
 
@@ -295,6 +325,54 @@ impl ClientState {
             self.acks.pop_front();
         }
         self.acks.push_back(key);
+    }
+
+    /// Newest event timestamp already observed on `mailbox`.
+    pub fn cursor(&self, mailbox: &[u8; 32]) -> Option<u64> {
+        self.cursors
+            .iter()
+            .find(|cursor| &cursor.mailbox == mailbox)
+            .map(CursorRecord::resume_since)
+    }
+
+    /// Advance the replay cursor for a mailbox.
+    pub fn advance_cursor(&mut self, mailbox: [u8; 32], epoch: Option<u32>, created_at: u64) {
+        if let Some(cursor) = self
+            .cursors
+            .iter_mut()
+            .find(|cursor| cursor.mailbox == mailbox)
+        {
+            cursor.last_created_at = cursor.last_created_at.max(created_at);
+            if epoch.is_some() {
+                cursor.epoch = epoch;
+            }
+            return;
+        }
+
+        if self.cursors.len() >= CURSOR_CAPACITY {
+            // Drop the oldest cursor; a replay is safe, losing messages is not.
+            if let Some((index, _)) = self
+                .cursors
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, cursor)| cursor.last_created_at)
+            {
+                self.cursors.remove(index);
+            }
+        }
+        self.cursors.push(CursorRecord {
+            mailbox,
+            epoch,
+            last_created_at: created_at,
+        });
+    }
+
+    /// Forget cursors for epochs older than `min_epoch`.
+    pub fn prune_cursors(&mut self, min_epoch: u32) {
+        self.cursors.retain(|cursor| match cursor.epoch {
+            Some(epoch) => epoch >= min_epoch,
+            None => true,
+        });
     }
 
     /// Merge relay URLs, preserving order and dropping duplicates.
@@ -459,6 +537,33 @@ mod tests {
         state.mark_acked(&peer, &[9u8; 16]);
         assert!(state.acked(&peer, &[9u8; 16]));
         assert_eq!(state.acks.len(), 1);
+    }
+
+    #[test]
+    fn cursor_resume_is_exclusive_and_old_epochs_are_pruned() {
+        let mut state = ClientState::generate(Vec::new()).unwrap();
+        let mailbox = [4u8; 32];
+
+        assert_eq!(state.cursor(&mailbox), None);
+        state.advance_cursor(mailbox, Some(10), 100);
+        assert_eq!(state.cursor(&mailbox), Some(99));
+
+        // A later event moves the cursor forward, never backwards.
+        state.advance_cursor(mailbox, Some(10), 500);
+        state.advance_cursor(mailbox, Some(10), 400);
+        assert_eq!(state.cursor(&mailbox), Some(499));
+
+        let next_epoch = [5u8; 32];
+        let handshake = [6u8; 32];
+        state.advance_cursor(next_epoch, Some(11), 700);
+        state.advance_cursor(handshake, None, 800);
+        state.prune_cursors(10);
+        assert!(state.cursor(&next_epoch).is_some());
+        assert!(state.cursor(&handshake).is_some());
+
+        state.prune_cursors(12);
+        assert!(state.cursor(&next_epoch).is_none());
+        assert!(state.cursor(&handshake).is_some());
     }
 
     #[test]

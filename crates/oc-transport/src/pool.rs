@@ -1,13 +1,20 @@
 //! Relay pool with randomized fan-out and fallback.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::future::join_all;
+use futures_util::stream::{self, StreamExt};
 use oc_core::random_array;
 use oc_wire::RelayEvent;
 use url::Url;
 
 use crate::{Carrier, Error, EventStream, RelayClient, Result};
+
+/// Delay before the first reconnect attempt.
+const RECONNECT_INITIAL: Duration = Duration::from_millis(250);
+/// Upper bound for the exponential reconnect delay.
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// A set of interchangeable relays.
 #[derive(Default)]
@@ -111,6 +118,11 @@ impl RelayPool {
 
     /// Subscribe to several mailboxes through **every** relay and merge the
     /// streams. Duplicates are expected and must be dropped above this layer.
+    ///
+    /// Each relay stream is wrapped in an independent reconnect loop: a
+    /// refused connection, a closed socket or a relay that comes back later
+    /// never terminates the merged stream. This call itself cannot fail for
+    /// network reasons; it only fails when no relay or mailbox is configured.
     pub async fn subscribe_all_many(
         &self,
         mailboxes: &[[u8; 32]],
@@ -123,19 +135,14 @@ impl RelayPool {
             return Err(Error::Relay("no mailboxes requested".into()));
         }
 
-        let mut streams = Vec::with_capacity(self.relays.len());
-        let mut last_error = None;
-        for relay in &self.relays {
-            match relay.subscribe_many(mailboxes, since).await {
-                Ok(stream) => streams.push(stream),
-                Err(error) => last_error = Some(error),
-            }
-        }
-
-        if streams.is_empty() {
-            return Err(last_error.unwrap_or(Error::NoRelay));
-        }
-        Ok(Box::pin(futures_util::stream::select_all(streams)))
+        let streams: Vec<EventStream> = self
+            .relays
+            .iter()
+            .map(|relay| {
+                reconnect_stream(Arc::clone(relay), mailboxes.to_vec(), since)
+            })
+            .collect();
+        Ok(Box::pin(stream::select_all(streams)))
     }
 
     /// Health-check every relay.
@@ -151,6 +158,77 @@ impl RelayPool {
     }
 }
 
+struct ReconnectState {
+    carrier: Arc<dyn Carrier>,
+    mailboxes: Vec<[u8; 32]>,
+    since: u64,
+    stream: Option<EventStream>,
+    delay: Duration,
+}
+
+/// Wrap one carrier in an infinite reconnect loop.
+///
+/// The first subscription is attempted immediately. Failures and closed
+/// streams are retried with exponential backoff, so the caller keeps a single
+/// logical stream across network outages.
+fn reconnect_stream(
+    carrier: Arc<dyn Carrier>,
+    mailboxes: Vec<[u8; 32]>,
+    since: u64,
+) -> EventStream {
+    let state = ReconnectState {
+        carrier,
+        mailboxes,
+        since,
+        stream: None,
+        delay: Duration::ZERO,
+    };
+
+    Box::pin(stream::unfold(state, |mut state| async move {
+        loop {
+            if state.stream.is_none() {
+                if !state.delay.is_zero() {
+                    tokio::time::sleep(state.delay).await;
+                }
+                match state
+                    .carrier
+                    .subscribe_many(&state.mailboxes, state.since)
+                    .await
+                {
+                    Ok(subscription) => {
+                        state.stream = Some(subscription);
+                        state.delay = RECONNECT_INITIAL;
+                    }
+                    Err(_) => {
+                        state.delay = next_delay(state.delay);
+                        continue;
+                    }
+                }
+            }
+
+            let Some(subscription) = state.stream.as_mut() else {
+                continue;
+            };
+            let next = subscription.next().await;
+            match next {
+                Some(Ok(event)) => return Some((Ok(event), state)),
+                Some(Err(_)) | None => {
+                    state.stream = None;
+                    state.delay = next_delay(state.delay);
+                }
+            }
+        }
+    }))
+}
+
+fn next_delay(current: Duration) -> Duration {
+    if current.is_zero() {
+        RECONNECT_INITIAL
+    } else {
+        (current * 2).min(RECONNECT_MAX)
+    }
+}
+
 /// Pick `count` unique indices, rotated by a random offset.
 fn pick_indices(len: usize, count: usize) -> Vec<usize> {
     if len == 0 {
@@ -163,7 +241,70 @@ fn pick_indices(len: usize, count: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+
     use super::*;
+
+    struct FlakyCarrier {
+        url: Url,
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Carrier for FlakyCarrier {
+        fn endpoint(&self) -> &Url {
+            &self.url
+        }
+
+        async fn health(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn publish(&self, _event: &RelayEvent) -> Result<()> {
+            Ok(())
+        }
+
+        async fn subscribe(&self, mailbox: &[u8; 32], since: u64) -> Result<EventStream> {
+            self.subscribe_many(core::slice::from_ref(mailbox), since)
+                .await
+        }
+
+        async fn subscribe_many(
+            &self,
+            mailboxes: &[[u8; 32]],
+            _since: u64,
+        ) -> Result<EventStream> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                return Err(Error::Relay("offline".into()));
+            }
+            let event = RelayEvent::new(mailboxes[0], vec![1, 2, 3], 60);
+            Ok(Box::pin(stream::iter(vec![Ok(event)])))
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_stream_survives_initial_failures() {
+        let carrier = Arc::new(FlakyCarrier {
+            url: Url::parse("https://flaky.example").unwrap(),
+            attempts: AtomicUsize::new(0),
+        });
+        let mut pool = RelayPool::new();
+        pool.add(carrier.clone());
+
+        let mut events = pool
+            .subscribe_all_many(&[[7u8; 32]], 0)
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .expect("reconnect should not time out")
+            .expect("stream should stay open")
+            .expect("event should decode");
+        assert_eq!(event.mailbox, [7u8; 32]);
+        assert!(carrier.attempts.load(Ordering::SeqCst) >= 3);
+    }
 
     #[test]
     fn picking_is_unique_and_in_range() {

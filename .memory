@@ -2,8 +2,8 @@
 
 Обновлено: 2026-11-08
 Ветка: `main`
-Статус: P4 в работе (outbox, ACK и ретраи готовы)
-Тестов: 73
+Статус: P4 в работе (outbox, ACK, reconnect, курсоры готовы)
+Тестов: 76
 
 > Этот файл — точка входа для ИИ-агентов. Прочитай его и `SPEC.md`
 > перед любыми изменениями. После каждого завершённого этапа обновляй
@@ -33,7 +33,7 @@
 | P1: `oc-core` — крипто и протокол | готово, 33 теста |
 | P2: `oc-wire`, `oc-transport`, `oc-relay` | готово, 18 тестов |
 | P3: `oc-client` + CLI (invite → handshake → текст) | готово, 19 тестов |
-| P4: reconnect, outbox, prekey rotation, default pool, MQTT | **в работе**: outbox + ACK + ретраи готовы |
+| P4: reconnect, outbox, prekey rotation, default pool, MQTT | **в работе**: outbox/ACK/reconnect/курсоры готовы |
 | P5: desktop UI (Linux gnu/musl, Windows) | не начато |
 | P6: Tor, cover traffic, аудит, mobile | не начато |
 
@@ -86,6 +86,8 @@ openchat/
 - `Carrier` trait: `health`, `publish`, `subscribe`, `subscribe_many`.
 - `RelayClient` — WebSocket, TLS через rustls + ring.
 - `RelayPool` — fan-out, fallback, `subscribe_all_many` (merge всех релеев).
+  Каждый поток релея в бесконечном reconnect-loop (250 ms … 30 s);
+  `subscribe_all_many` не падает из-за сети.
 - `relay_list` — парсинг `relays/default.json`.
 
 ### `oc-relay`
@@ -107,8 +109,10 @@ openchat/
 - `client.rs` — `Client::{create,open,invite,add_invite,send_text,listen_once,
   flush_outbox}`. `send_text`/`add_invite` кладут событие в outbox **до**
   публикации; `listen_once` ретраит должное, расшифровывает и шлёт ACK.
-- `state.rs` — `OutboxRecord` (sealed payload + backoff) и последние 4096
-  ACK (`peer_id || msg_id`).
+- `state.rs` — `OutboxRecord` (sealed payload + backoff), последние 4096
+  ACK (`peer_id || msg_id`) и per-mailbox курсоры `CursorRecord`.
+- `listen_once` подписывается от минимума курсоров (с учётом создания
+  prekey/контакта и начала эпохи), а не от `0`.
 - Handshake публикуется на `SPK` (sealed), ответчик слушает `SPK` + все
   слоты текущей и следующей эпохи для каждого контакта.
 - Все подписки идут одним WebSocket через `subscribe`.
@@ -167,7 +171,7 @@ cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Ожидаемо: 73 теста. Ручная проверка релея:
+Ожидаемо: 76 тестов. Ручная проверка релея:
 
 ```bash
 cargo run -p oc-relay -- --listen 127.0.0.1:8080
@@ -187,12 +191,12 @@ curl http://127.0.0.1:8080/health
    экспоненциальный backoff, `oc flush` / `oc outbox`.
 2. ~~Нет ACK~~ — готово: кадр `ACK`, отправитель видит подтверждение
    (`oc listen` печатает `ack: …`).
-3. **Нет per-mailbox курсора** — `listen` перечитывает с `since=0`;
-   дубликаты гасятся ratchet-ключами и `seen`, но это лишний трафик.
-4. **Ошибка одного relay-стрима обрывает `listen_once`** — нет reconnect
-   и backoff.
-5. **`subscribe_all_many`** подключается ко всем релеям, но при падении
-   любого из них стрим завершается ошибкой.
+3. ~~Нет per-mailbox курсора~~ — готово: `CursorRecord`, подписка от
+   минимального курсора.
+4. ~~Ошибка одного relay-стрима обрывает `listen_once`~~ — готово:
+   reconnect с backoff.
+5. ~~`subscribe_all_many` падает из-за одного релея~~ — готово: каждый
+   поток переподключается независимо.
 6. **Автоприём handshake** — любой, у кого есть invite, создаёт контакт
    (сначала `verified = false`); нет подтверждения/блокировки спама.
 7. **Handshake-mailbox = SPK** — стабилен до ротации prekey (7 дней),
@@ -240,10 +244,12 @@ curl http://127.0.0.1:8080/health
    - Повторная публикация с exponential backoff, TTL.
    - E2E: офлайн-отправка (handshake + текст) доставляется после
      восстановления релея, ACK доходит до отправителя.
-2. **Reconnect и курсоры**
+2. **Reconnect и курсоры** — готово
    - `subscribe_all_many` не падает из-за одного релея: ошибки потока
      превращать в reconnect.
    - Per-mailbox `since`/last-created_at, чтобы не перечитывать всё.
+   - E2E: listen во время падения релея возвращается без ошибки; после
+     рестарта релея сообщение доставляется.
 3. **Prekey rotation**
    - Ротация SPK/PQ раз в 7 дней, old prekeys ещё принимают handshake.
    - One-time prekeys (X3DH OPK) и handshake-mailbox на их основе.

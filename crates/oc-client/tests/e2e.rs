@@ -171,6 +171,71 @@ async fn state_and_sessions_survive_restart() {
 }
 
 #[tokio::test]
+async fn listen_survives_relay_outage_and_messages_are_redelivered() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let url = format!("http://{address}");
+    let pool = RelayPool::from_urls([url.clone()]).unwrap();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let _ = Relay::new(RelayConfig::default())
+            .serve_until(listener, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    let mut alice = client(alice_dir.path(), "alice-passphrase", &url);
+    let mut bob = client(bob_dir.path(), "bob-passphrase", &url);
+    let bob_id = bob.peer_id().unwrap();
+    let alice_id = alice.peer_id().unwrap();
+
+    let invite = bob.invite().unwrap();
+    alice.add_invite(&invite, &pool, 1).await.unwrap();
+    bob.listen_once(&pool, Duration::from_millis(400), 0)
+        .await
+        .unwrap();
+    assert!(bob.contact(&alice_id).is_some());
+
+    // Stop the relay and wait until the listener is really gone.
+    shutdown_tx.send(()).unwrap();
+    server.await.unwrap();
+
+    let sent = alice
+        .send_text(&bob_id, "during outage", &pool, 1)
+        .await
+        .unwrap();
+    assert!(sent.queued);
+
+    // A listen pass during the outage must return cleanly, not fail.
+    let idle = bob
+        .listen_once(&pool, Duration::from_millis(400), 0)
+        .await
+        .unwrap();
+    assert!(idle.messages.is_empty());
+
+    // Bring the relay back on the same address.
+    let listener = TcpListener::bind(address).await.unwrap();
+    let relay = Relay::new(RelayConfig::default());
+    tokio::spawn(async move {
+        let _ = relay.serve(listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(alice.flush_outbox(&pool, 1).await.unwrap(), 1);
+    let incoming = bob
+        .listen_once(&pool, Duration::from_millis(500), 0)
+        .await
+        .unwrap();
+    assert_eq!(incoming.messages.len(), 1);
+    assert_eq!(incoming.messages[0].msg_id, sent.msg_id);
+    assert_eq!(incoming.messages[0].text, "during outage");
+}
+
+#[tokio::test]
 async fn offline_messages_deliver_and_are_acknowledged_after_reconnect() {
     // Reserve a port, then release it so the first publishes hit a closed
     // port instead of a hanging server.
