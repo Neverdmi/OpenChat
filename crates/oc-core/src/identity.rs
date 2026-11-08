@@ -124,6 +124,20 @@ impl PublicIdentity {
     }
 }
 
+/// Verify a detached Ed25519 signature with a raw public key.
+///
+/// Used for signed relay manifests, where there is a single signing key and
+/// no X25519 identity half.
+pub fn verify_signature(
+    public_key: &[u8; PUBLIC_KEY_LEN],
+    message: &[u8],
+    signature: &[u8; SIGNATURE_LEN],
+) -> Result<()> {
+    let key = VerifyingKey::from_bytes(public_key).map_err(|_| Error::InvalidKey)?;
+    key.verify_strict(message, &Signature::from_bytes(signature))
+        .map_err(|_| Error::BadSignature)
+}
+
 /// Safety number for out-of-band key verification.
 ///
 /// Independent of argument order: both sides compute the same value.

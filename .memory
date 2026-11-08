@@ -2,8 +2,8 @@
 
 Обновлено: 2026-11-08
 Ветка: `main`
-Статус: P4 в работе (outbox, ACK, reconnect, курсоры, ротация prekey готовы)
-Тестов: 78
+Статус: P4 в работе (доставка, reconnect, ротация prekey, пул и манифест готовы)
+Тестов: 81
 
 > Этот файл — точка входа для ИИ-агентов. Прочитай его и `SPEC.md`
 > перед любыми изменениями. После каждого завершённого этапа обновляй
@@ -33,7 +33,7 @@
 | P1: `oc-core` — крипто и протокол | готово, 33 теста |
 | P2: `oc-wire`, `oc-transport`, `oc-relay` | готово, 18 тестов |
 | P3: `oc-client` + CLI (invite → handshake → текст) | готово, 19 тестов |
-| P4: reconnect, outbox, prekey rotation, default pool, MQTT | **в работе**: outbox/ACK/reconnect/курсоры/ротация prekey готовы |
+| P4: reconnect, outbox, prekey rotation, default pool, MQTT | **почти готово**: остались публичный релей и MQTT |
 | P5: desktop UI (Linux gnu/musl, Windows) | не начато |
 | P6: Tor, cover traffic, аудит, mobile | не начато |
 
@@ -86,9 +86,10 @@ openchat/
 - `Carrier` trait: `health`, `publish`, `subscribe`, `subscribe_many`.
 - `RelayClient` — WebSocket, TLS через rustls + ring.
 - `RelayPool` — fan-out, fallback, `subscribe_all_many` (merge всех релеев).
-  Каждый поток релея в бесконечном reconnect-loop (250 ms … 30 s);
-  `subscribe_all_many` не падает из-за сети.
-- `relay_list` — парсинг `relays/default.json`.
+  Каждый поток в reconnect-loop (250 ms … 30 s). Две последовательные
+  ошибки временно исключают релей из fan-out; health-check сбрасывает.
+- `relay_list` — `relays/default.json` + подписанный манифест
+  (`RelayManifest`: Ed25519, `expires_at`, канонический JSON).
 
 ### `oc-relay`
 - Store-and-forward по одноразовым ящикам.
@@ -126,7 +127,7 @@ openchat/
 
 ### `oc-cli`
 - Бинарник `oc`, команды: `init`, `invite`, `add`, `send`, `listen`,
-  `contacts`, `flush`, `outbox`, `rotate`.
+  `contacts`, `flush`, `outbox`, `rotate`, `relays [--add URL] [--check]`.
 - Пароль: `OPENCHAT_PASSPHRASE` или `rpassword` prompt.
 - `--home` / `OPENCHAT_HOME`, по умолчанию `~/.openchat`.
 - `listen --once --idle N` — drain и выход; без `--once` — цикл.
@@ -174,7 +175,7 @@ cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Ожидаемо: 78 тестов. Ручная проверка релея:
+Ожидаемо: 81 тест. Ручная проверка релея:
 
 ```bash
 cargo run -p oc-relay -- --listen 127.0.0.1:8080
@@ -206,8 +207,8 @@ curl http://127.0.0.1:8080/health
    нет one-time prekeys. Ротация и retired prekeys готовы.
 8. ~~Нет ротации SPK/PQ prekey~~ — готово: авто раз в 7 дней + `oc rotate`.
 9. **Нет QR** — только текстовая invite-ссылка (~2.3 KB).
-10. **Нет команд управления релеями** — список задаётся при `init` и
-    дополняется relay hints из invite.
+10. ~~Нет команд управления релеями~~ — `oc relays --add/--check`;
+    список по-прежнему дополняется relay hints из invite.
 11. **Нет шифрования метаданных очереди** — хранится только необходимое,
     но размеры состояния видны по файлу.
 

@@ -171,6 +171,49 @@ async fn state_and_sessions_survive_restart() {
 }
 
 #[tokio::test]
+async fn multiple_relays_with_one_dead_still_deliver() {
+    let live = start_relay().await;
+    let dead = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}")
+    };
+    let relays = vec![dead, live];
+    let pool = RelayPool::from_urls(relays.clone()).unwrap();
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    let mut alice = client(alice_dir.path(), "alice-passphrase", &relays[1]);
+    let mut bob = client(bob_dir.path(), "bob-passphrase", &relays[1]);
+    let alice_id = alice.peer_id().unwrap();
+    let bob_id = bob.peer_id().unwrap();
+
+    let invite = bob.invite().unwrap();
+    let summary = alice.add_invite(&invite, &pool, 2).await.unwrap();
+    assert_eq!(summary.delivered, 1);
+    assert!(!summary.queued);
+
+    let incoming = bob
+        .listen_once(&pool, Duration::from_millis(500), 0)
+        .await
+        .unwrap();
+    assert_eq!(incoming.added_contacts, vec![alice_id]);
+
+    let sent = alice
+        .send_text(&bob_id, "through the live relay", &pool, 2)
+        .await
+        .unwrap();
+    assert_eq!(sent.delivered, 1);
+    let incoming = bob
+        .listen_once(&pool, Duration::from_millis(500), 0)
+        .await
+        .unwrap();
+    assert_eq!(incoming.messages.len(), 1);
+    assert_eq!(incoming.messages[0].msg_id, sent.msg_id);
+}
+
+#[tokio::test]
 async fn old_invites_still_work_after_prekey_rotation() {
     let url = start_relay().await;
     let pool = RelayPool::from_urls([url.clone()]).unwrap();

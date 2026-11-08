@@ -1,6 +1,7 @@
 //! Relay pool with randomized fan-out and fallback.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use futures_util::future::join_all;
@@ -15,11 +16,39 @@ use crate::{Carrier, Error, EventStream, RelayClient, Result};
 const RECONNECT_INITIAL: Duration = Duration::from_millis(250);
 /// Upper bound for the exponential reconnect delay.
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// Consecutive failures after which a relay is temporarily deprioritised.
+const MAX_CONSECUTIVE_FAILURES: u32 = 2;
+
+struct PoolEntry {
+    carrier: Arc<dyn Carrier>,
+    failures: AtomicU32,
+}
+
+impl PoolEntry {
+    fn new(carrier: Arc<dyn Carrier>) -> Self {
+        Self {
+            carrier,
+            failures: AtomicU32::new(0),
+        }
+    }
+
+    fn healthy(&self) -> bool {
+        self.failures.load(Ordering::Relaxed) < MAX_CONSECUTIVE_FAILURES
+    }
+
+    fn succeeded(&self) {
+        self.failures.store(0, Ordering::Relaxed);
+    }
+
+    fn failed(&self) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// A set of interchangeable relays.
 #[derive(Default)]
 pub struct RelayPool {
-    relays: Vec<Arc<dyn Carrier>>,
+    relays: Vec<PoolEntry>,
 }
 
 impl RelayPool {
@@ -43,13 +72,13 @@ impl RelayPool {
     /// Add a relay by URL.
     pub fn add_url(&mut self, url: &str) -> Result<()> {
         let client = RelayClient::from_url(url)?;
-        self.relays.push(Arc::new(client));
+        self.add(Arc::new(client));
         Ok(())
     }
 
     /// Add a pre-built carrier.
     pub fn add(&mut self, carrier: Arc<dyn Carrier>) {
-        self.relays.push(carrier);
+        self.relays.push(PoolEntry::new(carrier));
     }
 
     /// Number of relays.
@@ -64,7 +93,15 @@ impl RelayPool {
 
     /// Endpoints of all relays.
     pub fn endpoints(&self) -> Vec<&Url> {
-        self.relays.iter().map(|relay| relay.endpoint()).collect()
+        self.relays
+            .iter()
+            .map(|entry| entry.carrier.endpoint())
+            .collect()
+    }
+
+    /// Number of relays currently considered healthy.
+    pub fn healthy_count(&self) -> usize {
+        self.relays.iter().filter(|entry| entry.healthy()).count()
     }
 
     /// Publish to up to `fanout` randomly chosen relays.
@@ -76,19 +113,45 @@ impl RelayPool {
             return Err(Error::NoRelay);
         }
 
-        let indices = pick_indices(self.relays.len(), fanout.max(1));
-        let futures = indices.into_iter().map(|index| {
-            let relay = Arc::clone(&self.relays[index]);
+        let indices = self.pick_fanout(fanout.max(1));
+        let futures = indices.iter().map(|&index| {
+            let relay = Arc::clone(&self.relays[index].carrier);
             let event = event.clone();
             async move { relay.publish(&event).await }
         });
 
         let results = join_all(futures).await;
-        let successes = results.iter().filter(|result| result.is_ok()).count();
+        let mut successes = 0;
+        for (&index, result) in indices.iter().zip(&results) {
+            if result.is_ok() {
+                self.relays[index].succeeded();
+                successes += 1;
+            } else {
+                self.relays[index].failed();
+            }
+        }
         if successes == 0 {
             return Err(Error::NoRelay);
         }
         Ok(successes)
+    }
+
+    /// Pick healthy relays first, falling back to all relays when every
+    /// candidate has been marked dead (so recovered relays get another
+    /// chance without an explicit health check).
+    fn pick_fanout(&self, count: usize) -> Vec<usize> {
+        let healthy: Vec<usize> = self
+            .relays
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.healthy())
+            .map(|(index, _)| index)
+            .collect();
+        if healthy.is_empty() {
+            pick_indices(self.relays.len(), count)
+        } else {
+            pick_from(&healthy, count)
+        }
     }
 
     /// Subscribe through the first relay that accepts the connection.
@@ -108,9 +171,19 @@ impl RelayPool {
 
         let mut last_error = None;
         for index in pick_indices(self.relays.len(), self.relays.len()) {
-            match self.relays[index].subscribe_many(mailboxes, since).await {
-                Ok(stream) => return Ok(stream),
-                Err(error) => last_error = Some(error),
+            match self.relays[index]
+                .carrier
+                .subscribe_many(mailboxes, since)
+                .await
+            {
+                Ok(stream) => {
+                    self.relays[index].succeeded();
+                    return Ok(stream);
+                }
+                Err(error) => {
+                    self.relays[index].failed();
+                    last_error = Some(error);
+                }
             }
         }
         Err(last_error.unwrap_or(Error::NoRelay))
@@ -138,23 +211,31 @@ impl RelayPool {
         let streams: Vec<EventStream> = self
             .relays
             .iter()
-            .map(|relay| {
-                reconnect_stream(Arc::clone(relay), mailboxes.to_vec(), since)
+            .map(|entry| {
+                reconnect_stream(Arc::clone(&entry.carrier), mailboxes.to_vec(), since)
             })
             .collect();
         Ok(Box::pin(stream::select_all(streams)))
     }
 
-    /// Health-check every relay.
+    /// Health-check every relay and refresh the dead-relay cache.
     pub async fn health(&self) -> Vec<(String, bool)> {
-        let futures = self.relays.iter().map(|relay| {
-            let relay = Arc::clone(relay);
+        let futures = self.relays.iter().map(|entry| {
+            let carrier = Arc::clone(&entry.carrier);
             async move {
-                let healthy = relay.health().await.is_ok();
-                (relay.endpoint().to_string(), healthy)
+                let healthy = carrier.health().await.is_ok();
+                (carrier.endpoint().to_string(), healthy)
             }
         });
-        join_all(futures).await
+        let results = join_all(futures).await;
+        for (entry, (_, healthy)) in self.relays.iter().zip(&results) {
+            if *healthy {
+                entry.succeeded();
+            } else {
+                entry.failed();
+            }
+        }
+        results
     }
 }
 
@@ -229,6 +310,19 @@ fn next_delay(current: Duration) -> Duration {
     }
 }
 
+/// Pick `count` unique entries from a candidate list, rotated by a random
+/// offset.
+fn pick_from(candidates: &[usize], count: usize) -> Vec<usize> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let count = count.min(candidates.len());
+    let offset = u32::from_le_bytes(random_array::<4>()) as usize % candidates.len();
+    (0..count)
+        .map(|index| candidates[(offset + index) % candidates.len()])
+        .collect()
+}
+
 /// Pick `count` unique indices, rotated by a random offset.
 fn pick_indices(len: usize, count: usize) -> Vec<usize> {
     if len == 0 {
@@ -282,6 +376,64 @@ mod tests {
             let event = RelayEvent::new(mailboxes[0], vec![1, 2, 3], 60);
             Ok(Box::pin(stream::iter(vec![Ok(event)])))
         }
+    }
+
+    struct PublishMock {
+        url: Url,
+        attempts: AtomicUsize,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Carrier for PublishMock {
+        fn endpoint(&self) -> &Url {
+            &self.url
+        }
+
+        async fn health(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn publish(&self, _event: &RelayEvent) -> Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(Error::Relay("unreachable".into()))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn subscribe(&self, _mailbox: &[u8; 32], _since: u64) -> Result<EventStream> {
+            Err(Error::Relay("not used".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn dead_relays_are_deprioritised_after_failures() {
+        let good = Arc::new(PublishMock {
+            url: Url::parse("https://good.example").unwrap(),
+            attempts: AtomicUsize::new(0),
+            fail: false,
+        });
+        let bad = Arc::new(PublishMock {
+            url: Url::parse("https://bad.example").unwrap(),
+            attempts: AtomicUsize::new(0),
+            fail: true,
+        });
+        let mut pool = RelayPool::new();
+        pool.add(bad.clone());
+        pool.add(good.clone());
+
+        let event = RelayEvent::new([0u8; 32], vec![1], 60);
+        for _ in 0..4 {
+            assert_eq!(pool.publish(&event, 2).await.unwrap(), 1);
+        }
+        assert_eq!(
+            bad.attempts.load(Ordering::SeqCst),
+            MAX_CONSECUTIVE_FAILURES as usize
+        );
+        assert_eq!(good.attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(pool.healthy_count(), 1);
     }
 
     #[tokio::test]

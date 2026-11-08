@@ -92,6 +92,17 @@ enum Command {
 
     /// Rotate signed/PQ prekeys now; old invites keep working.
     Rotate,
+
+    /// List configured relays, optionally add one or health-check them.
+    Relays {
+        /// Add a relay URL to the local list.
+        #[arg(long = "add", value_name = "URL")]
+        add: Vec<String>,
+
+        /// Ping every relay and report reachability.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[tokio::main]
@@ -219,8 +230,34 @@ async fn run() -> Result<()> {
             let passphrase = passphrase(false)?;
             let mut client = open_client(&args.home, &passphrase)?;
             client.rotate_prekeys()?;
-            println!("prekeys rotated; {} prekey(s) accept handshakes", client.prekey_count());
+            println!(
+                "prekeys rotated; {} prekey(s) accept handshakes",
+                client.prekey_count()
+            );
             println!("new invite: {}", client.invite()?);
+            Ok(())
+        }
+        Command::Relays { add, check } => {
+            let passphrase = passphrase(false)?;
+            let mut client = open_client(&args.home, &passphrase)?;
+            if !add.is_empty() {
+                client.add_relays(add)?;
+            }
+
+            if client.relays().is_empty() {
+                println!("no relays configured");
+                return Ok(());
+            }
+            if check {
+                let pool = build_pool(client.relays())?;
+                for (url, healthy) in pool.health().await {
+                    println!("{}  {url}", if healthy { "ok  " } else { "dead" });
+                }
+            } else {
+                for relay in client.relays() {
+                    println!("{relay}");
+                }
+            }
             Ok(())
         }
         Command::Contacts => {
