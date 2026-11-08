@@ -126,7 +126,7 @@ fn validate_relays(relays: &[String]) -> Result<()> {
     for relay in relays {
         let url = Url::parse(relay).map_err(|_| Error::Invite)?;
         match url.scheme() {
-            "http" | "https" | "ws" | "wss" => {}
+            "http" | "https" | "ws" | "wss" | "mqtt" | "mqtts" | "mqtttls" => {}
             _ => return Err(Error::Invite),
         }
         if url.host_str().is_none() {
@@ -193,5 +193,21 @@ mod tests {
         let (_, bundle) = PrekeyPair::generate(&bob);
         assert!(Invite::new(bundle.clone(), vec!["ftp://relay.example".into()]).is_err());
         assert!(Invite::new(bundle, vec!["not a url".into()]).is_err());
+    }
+
+    #[test]
+    fn mqtt_relay_hints_roundtrip() {
+        let bob = Identity::generate();
+        let (_, bundle) = PrekeyPair::generate(&bob);
+        let invite = Invite::new(
+            bundle,
+            vec![
+                "mqtts://broker.hivemq.com:8884/mqtt".into(),
+                "mqtttls://broker.emqx.io:8883".into(),
+            ],
+        )
+        .unwrap();
+        let decoded = Invite::decode(&invite.encode()).unwrap();
+        assert_eq!(decoded.relays, invite.relays);
     }
 }

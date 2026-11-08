@@ -35,11 +35,18 @@ relay), `mqtts://`/`mqtt://` (MQTT over WebSocket) and `mqtttls://`
 | `mqtttls://broker.emqx.io:8883` | EMQX public broker | native TLS |
 | `mqtts://test.mosquitto.org:8081/` | Eclipse Mosquitto test broker | WSS |
 
+Design goal: **anyone can chat without raising a server** — install the
+client, `oc init`, and the built-in public brokers are used automatically.
+No account, no signup, no self-hosting required. Both sides must be
+online at the same time (MQTT brokers are live-only); store-and-forward
+only exists on `oc-relay` instances a user may add themselves later.
+
 Caveats, honestly:
 
-- These are **public demo/test brokers**, shared with everyone. They are
-  intended for testing, may be slow, rate-limited, restarted without
-  notice, or shut down. Nothing important may rely on them.
+- These are **public shared brokers** (HiveMQ/EMQX present them as free
+  public brokers for anyone to connect). They may be slow, rate-limited,
+  restarted without notice, or shut down. Nothing important may rely
+  on them.
 - The Mosquitto test broker's WebSocket listener is intermittently
   unavailable (the maintainer says so explicitly). The pool marks dead
   relays automatically, so a dead entry costs nothing but a failed
