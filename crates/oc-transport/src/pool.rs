@@ -10,6 +10,7 @@ use oc_core::random_array;
 use oc_wire::RelayEvent;
 use url::Url;
 
+use crate::socks5::TorConfig;
 use crate::{Carrier, Error, EventStream, MqttClient, RelayClient, Result};
 
 /// Delay before the first reconnect attempt.
@@ -69,6 +70,18 @@ impl RelayPool {
         Ok(pool)
     }
 
+    /// Build a pool from relay URL strings with Tor routing applied.
+    pub fn from_urls_with_tor<I>(urls: I, tor: &TorConfig) -> Result<Self>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut pool = Self::new();
+        for url in urls {
+            pool.add_url_with_tor(&url, tor)?;
+        }
+        Ok(pool)
+    }
+
     /// Add a relay by URL.
     ///
     /// `mqtts://`/`mqtt://` endpoints become an MQTT-over-WSS carrier and
@@ -76,10 +89,17 @@ impl RelayPool {
     /// everything else is a WebSocket relay ([`RelayClient`]). All are
     /// interchangeable in the pool, so one [`RelayPool`] can mix carriers.
     pub fn add_url(&mut self, url: &str) -> Result<()> {
+        self.add_url_with_tor(url, &TorConfig::direct())
+    }
+
+    /// Add a relay by URL with Tor routing applied.
+    pub fn add_url_with_tor(&mut self, url: &str, tor: &TorConfig) -> Result<()> {
         let parsed = Url::parse(url).map_err(|error| Error::Url(error.to_string()))?;
         match parsed.scheme() {
-            "mqtts" | "mqtt" | "mqtttls" => self.add(Arc::new(MqttClient::new(parsed))),
-            _ => self.add(Arc::new(RelayClient::new(parsed))),
+            "mqtts" | "mqtt" | "mqtttls" => {
+                self.add(Arc::new(MqttClient::new(parsed).with_tor(tor.clone())))
+            }
+            _ => self.add(Arc::new(RelayClient::new(parsed).with_tor(tor.clone()))),
         }
         Ok(())
     }

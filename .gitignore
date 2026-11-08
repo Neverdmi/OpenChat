@@ -5,5 +5,8 @@
 state.enc
 state.enc.tmp
 
+# Local idea backlog: never publish to GitHub.
+.ideas
+
 # .memory is intentionally tracked: AI agent notes must never be ignored.
 !.memory

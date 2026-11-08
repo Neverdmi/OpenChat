@@ -5,6 +5,7 @@
 //! binary instead, e.g. `oc-tui --cli chat <peer>`.
 
 mod app;
+mod settings;
 
 use std::ffi::OsString;
 use std::io;
@@ -108,6 +109,15 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::
     Ok(())
 }
 
+/// Adjust the settings row under the cursor.
+fn adjust_setting(app: &mut TuiApp, delta: i32) {
+    match app.settings_row {
+        0 => app.cycle_tor(delta),
+        1 => app.adjust_fanout(delta),
+        _ => app.toggle_invite_on_start(),
+    }
+}
+
 fn handle_key(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) {
     if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
         app.should_quit = true;
@@ -157,6 +167,23 @@ fn handle_key(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) {
                 app::LockField::Passphrase => app.passphrase.push(ch),
                 app::LockField::Confirm => app.confirm_passphrase.push(ch),
             },
+            _ => {}
+        }
+        return;
+    }
+
+    // Settings menu keys.
+    if app.show_settings {
+        match code {
+            KeyCode::Esc => app.show_settings = false,
+            KeyCode::Up => {
+                app.settings_row = app.settings_row.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                app.settings_row = (app.settings_row + 1).min(2);
+            }
+            KeyCode::Left => adjust_setting(app, -1),
+            KeyCode::Right => adjust_setting(app, 1),
             _ => {}
         }
         return;
@@ -250,6 +277,58 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TuiApp) {
         .block(Block::default().borders(Borders::ALL).title("Contacts (Tab)"))
         .highlight_style(Style::default().add_modifier(Modifier::BOLD));
     frame.render_stateful_widget(contacts, body[0], &mut state);
+
+    // Settings panel replaces the conversation while it is open.
+    if app.show_settings {
+        let tor = match app.settings.tor_mode {
+            settings::TorModeSetting::Off => "off",
+            settings::TorModeSetting::Fallback => "fallback",
+            settings::TorModeSetting::Always => "always",
+        };
+        let tor_note = if app.settings.tor_mode == settings::TorModeSetting::Off {
+            String::new()
+        } else {
+            "  (needs tor binary installed)".to_string()
+        };
+        let rows = [
+            format!("Tor mode: {tor}{tor_note}"),
+            format!("Fanout: {} relay(s) per publish", app.settings.fanout),
+            format!(
+                "Show invite on start: {}",
+                if app.settings.show_invite_on_start {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ),
+        ];
+        let mut lines: Vec<Line> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let style = if index == app.settings_row {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let prefix = if index == app.settings_row {
+                    "> "
+                } else {
+                    "  "
+                };
+                Line::from(Span::styled(format!("{prefix}{row}"), style))
+            })
+            .collect();
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "↑↓ select · ←/→ change (saved immediately) · Esc close",
+        ));
+        let panel = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Settings"));
+        frame.render_widget(panel, body[1]);
+        render_input_and_footer(frame, app, chunks);
+        return;
+    }
 
     // Invite panel replaces the conversation while it is open.
     if app.show_invite {

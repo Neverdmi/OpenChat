@@ -11,7 +11,10 @@ use std::time::Duration;
 
 use oc_client::invite::short_peer_id;
 use oc_client::{Client, ListenOutcome, StateStore};
-use oc_transport::RelayPool;
+use oc_transport::socks5::TorConfig;
+use oc_transport::{RelayPool, TorMode};
+
+use crate::settings::{self, Settings};
 
 /// One contact as shown in the sidebar.
 #[derive(Debug, Clone)]
@@ -86,6 +89,8 @@ pub enum WorkerCommand {
     AddInvite(String),
     /// Retry the whole outbox now.
     Flush,
+    /// Stop the worker thread (used when restarting with new settings).
+    Shutdown,
 }
 
 /// Handles to the running worker thread.
@@ -140,6 +145,8 @@ pub enum InputAction {
     Flush,
     /// Show the full invite link panel.
     Invite,
+    /// Open the settings menu.
+    Settings,
     /// Add a contact from this invite link.
     AddInvite(String),
     /// Send this text to the selected peer.
@@ -166,6 +173,9 @@ pub fn parse_input(line: &str) -> InputAction {
     }
     if line == "/invite" {
         return InputAction::Invite;
+    }
+    if line == "/settings" {
+        return InputAction::Settings;
     }
     if line.starts_with("openchat://") {
         return InputAction::AddInvite(line.to_string());
@@ -217,6 +227,12 @@ pub struct TuiApp {
     pub confirm_passphrase: String,
     /// Whether the full invite link panel is shown.
     pub show_invite: bool,
+    /// User settings (loaded from `settings.json` after unlocking).
+    pub settings: Settings,
+    /// Whether the settings menu is open.
+    pub show_settings: bool,
+    /// Selected row in the settings menu.
+    pub settings_row: usize,
     /// Last status message.
     pub status: String,
     /// Set when the user asked to quit.
@@ -245,6 +261,9 @@ impl TuiApp {
             lock_mode: LockMode::Unlock,
             confirm_passphrase: String::new(),
             show_invite: false,
+            settings: Settings::default(),
+            show_settings: false,
+            settings_row: 0,
             status: String::new(),
             should_quit: false,
         }
@@ -292,6 +311,11 @@ impl TuiApp {
             }
             InputAction::Invite => {
                 self.show_invite = true;
+                self.input.clear();
+            }
+            InputAction::Settings => {
+                self.show_settings = true;
+                self.settings_row = 0;
                 self.input.clear();
             }
             InputAction::AddInvite(link) => {
@@ -439,19 +463,10 @@ impl TuiApp {
                 .map_err(|error| format!("relay list: {error:#}"))?;
             let client = Client::create(store, relays)
                 .map_err(|error| format!("create client: {error:#}"))?;
-            Ok(spawn_worker(client))
+            self.settings = settings::load(&home);
+            Ok(spawn_worker(client, &home, self.settings.clone()))
         })();
-        match result {
-            Ok(worker) => {
-                self.worker = Some(worker);
-                self.error = None;
-                self.locked = false;
-                self.status = "identity created — share your invite with /invite".to_string();
-            }
-            Err(message) => {
-                self.error = Some(message);
-            }
-        }
+        self.finish_start(result, "identity created — share your invite with /invite");
     }
 
     /// Try to unlock the state and start the worker thread.
@@ -469,19 +484,69 @@ impl TuiApp {
                 .map_err(|error| format!("open state: {error:#}"))?;
             let client = Client::open(store)
                 .map_err(|error| format!("open client: {error:#}"))?;
-            Ok(spawn_worker(client))
+            self.settings = settings::load(&home);
+            Ok(spawn_worker(client, &home, self.settings.clone()))
         })();
+        self.finish_start(result, "unlocked");
+    }
+
+    fn finish_start(&mut self, result: Result<Worker, String>, ok_status: &str) {
         match result {
             Ok(worker) => {
                 self.worker = Some(worker);
                 self.error = None;
                 self.locked = false;
-                self.status = "unlocked".to_string();
+                self.status = ok_status.to_string();
+                if self.settings.show_invite_on_start {
+                    self.show_invite = true;
+                }
             }
             Err(message) => {
                 self.error = Some(message);
             }
         }
+    }
+
+    /// Restart the worker with the current settings (after a change).
+    pub fn restart_worker(&mut self) {
+        if let Some(worker) = &self.worker {
+            let _ = worker.commands.send(WorkerCommand::Shutdown);
+        }
+        self.worker = None;
+        self.unlock();
+    }
+
+    /// Persist settings and restart the worker so they take effect.
+    pub fn apply_settings(&mut self) {
+        let home = PathBuf::from(self.home.trim());
+        if let Err(error) = settings::save(&home, &self.settings) {
+            self.error = Some(format!("save settings: {error}"));
+            return;
+        }
+        self.status = "settings saved".to_string();
+        self.restart_worker();
+    }
+
+    /// Cycle the Tor mode by `delta` (settings menu).
+    pub fn cycle_tor(&mut self, delta: i32) {
+        self.settings.tor_mode = if delta >= 0 {
+            self.settings.tor_mode.next()
+        } else {
+            self.settings.tor_mode.prev()
+        };
+        self.apply_settings();
+    }
+
+    /// Adjust fan-out by `delta`, clamped to 1–5 (settings menu).
+    pub fn adjust_fanout(&mut self, delta: i32) {
+        self.settings.fanout = (self.settings.fanout as i32 + delta).clamp(1, 5) as usize;
+        self.apply_settings();
+    }
+
+    /// Toggle "show invite on start" (settings menu).
+    pub fn toggle_invite_on_start(&mut self) {
+        self.settings.show_invite_on_start = !self.settings.show_invite_on_start;
+        self.apply_settings();
     }
 }
 
@@ -537,14 +602,6 @@ pub fn default_home() -> PathBuf {
     PathBuf::from(".openchat")
 }
 
-fn build_pool(relays: &[String]) -> Result<RelayPool, String> {
-    if relays.is_empty() {
-        return Err("no relays configured".to_string());
-    }
-    RelayPool::from_urls(relays.iter().cloned())
-        .map_err(|error| format!("invalid relay list: {error:#}"))
-}
-
 fn snapshot(client: &Client) -> UiEvent {
     UiEvent::Snapshot {
         contacts: client
@@ -567,15 +624,16 @@ fn snapshot(client: &Client) -> UiEvent {
 }
 
 /// Spawn the background thread that owns the `Client` and the pool.
-pub fn spawn_worker(client: Client) -> Worker {
+pub fn spawn_worker(client: Client, home: &std::path::Path, settings: Settings) -> Worker {
     let (command_tx, command_rx) = mpsc::channel::<WorkerCommand>();
     let (event_tx, event_rx) = mpsc::channel::<UiEvent>();
+    let home = home.to_path_buf();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime for worker");
-        runtime.block_on(worker_loop(client, command_rx, event_tx));
+        runtime.block_on(worker_loop(client, home, settings, command_rx, event_tx));
     });
     Worker {
         commands: command_tx,
@@ -583,15 +641,86 @@ pub fn spawn_worker(client: Client) -> Worker {
     }
 }
 
+/// Start a local `tor` process and wait for its SOCKS5 port.
+///
+/// Returns the child process (killed when the worker exits) and the
+/// transport-layer Tor configuration.
+fn start_tor(home: &std::path::Path, mode: TorMode) -> Result<(std::process::Child, TorConfig), String> {
+    use std::net::TcpStream;
+    let data_dir = home.join("tor-data");
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|error| format!("tor data dir: {error}"))?;
+    let mut child = std::process::Command::new("tor")
+        .args([
+            "--SocksPort",
+            "127.0.0.1:9050",
+            "--DataDirectory",
+            &data_dir.to_string_lossy(),
+            "--LogLevel",
+            "notice",
+            "--ClientOnly",
+            "1",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            format!("tor binary not found ({error}); install tor to use Tor mode")
+        })?;
+    for _ in 0..60 {
+        if TcpStream::connect("127.0.0.1:9050").is_ok() {
+            return Ok((
+                child,
+                TorConfig {
+                    mode,
+                    proxy_host: "127.0.0.1".to_string(),
+                    proxy_port: 9050,
+                },
+            ));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!("tor exited during startup ({status})"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(500)),
+            Err(error) => return Err(format!("tor wait: {error}")),
+        }
+    }
+    let _ = child.kill();
+    Err("tor did not open its SOCKS port in time".to_string())
+}
+
 async fn worker_loop(
     mut client: Client,
+    home: std::path::PathBuf,
+    settings: Settings,
     commands: mpsc::Receiver<WorkerCommand>,
     events: mpsc::Sender<UiEvent>,
 ) {
-    let mut pool = match build_pool(client.relays()) {
+    // Tor process (if requested) lives as long as the worker.
+    let mut tor_child: Option<std::process::Child> = None;
+    let tor = match settings.tor_mode.to_mode() {
+        TorMode::Off => TorConfig::direct(),
+        mode => match start_tor(&home, mode) {
+            Ok((child, config)) => {
+                tor_child = Some(child);
+                config
+            }
+            Err(message) => {
+                let _ = events.send(UiEvent::Error(message));
+                return;
+            }
+        },
+    };
+    let fanout = settings.fanout.clamp(1, 5);
+    let mut pool = match RelayPool::from_urls_with_tor(client.relays().iter().cloned(), &tor) {
         Ok(pool) => pool,
-        Err(message) => {
-            let _ = events.send(UiEvent::Error(message));
+        Err(error) => {
+            let _ = events.send(UiEvent::Error(format!("relay list: {error:#}")));
+            if let Some(mut child) = tor_child {
+                let _ = child.kill();
+            }
             return;
         }
     };
@@ -601,8 +730,14 @@ async fn worker_loop(
         // Handle every queued command before the next receive pass.
         while let Ok(command) = commands.try_recv() {
             match command {
+                WorkerCommand::Shutdown => {
+                    if let Some(mut child) = tor_child {
+                        let _ = child.kill();
+                    }
+                    return;
+                }
                 WorkerCommand::Send { peer, text } => {
-                    match client.send_text(&peer, &text, &pool, 3).await {
+                    match client.send_text(&peer, &text, &pool, fanout).await {
                         Ok(sent) => {
                             let _ = events.send(UiEvent::Sent {
                                 queued: sent.queued,
@@ -615,11 +750,13 @@ async fn worker_loop(
                     }
                 }
                 WorkerCommand::AddInvite(link) => {
-                    match client.add_invite(&link, &pool, 3).await {
+                    match client.add_invite(&link, &pool, fanout).await {
                         Ok(summary) => {
                             // The invite may carry new relay hints; rebuild
                             // the pool so they are used from now on.
-                            if let Ok(new_pool) = build_pool(client.relays()) {
+                            if let Ok(new_pool) =
+                                RelayPool::from_urls_with_tor(client.relays().iter().cloned(), &tor)
+                            {
                                 pool = new_pool;
                             }
                             let _ = events.send(UiEvent::Added {
@@ -632,7 +769,7 @@ async fn worker_loop(
                         }
                     }
                 }
-                WorkerCommand::Flush => match client.flush_outbox(&pool, 3).await {
+                WorkerCommand::Flush => match client.flush_outbox(&pool, fanout).await {
                     Ok(delivered) => {
                         let _ = events.send(UiEvent::Flushed(delivered));
                     }

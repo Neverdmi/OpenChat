@@ -16,6 +16,7 @@ oc-wire = { path = "../oc-wire" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 tokio-rustls = "0.26"

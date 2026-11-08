@@ -4,12 +4,13 @@ use std::sync::Once;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use oc_wire::{ClientMessage, RelayEvent, ServerMessage};
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
+use crate::socks5::TorConfig;
+use crate::ws::{next_frame, send_frame, ws_connect, BoxWsStream};
 use crate::{Carrier, Error, EventStream, Result};
 
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -19,8 +20,7 @@ static INSTALL_PROVIDER: Once = Once::new();
 
 pub(crate) fn install_crypto_provider() {
     INSTALL_PROVIDER.call_once(|| {
-        // tokio-tungstenite builds rustls without a default provider. We
-        // explicitly enable `ring` (no cmake/aws-lc build dependency).
+        // rustls needs an explicit provider (`ring`, no cmake/aws-lc).
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
@@ -29,6 +29,7 @@ pub(crate) fn install_crypto_provider() {
 #[derive(Debug, Clone)]
 pub struct RelayClient {
     base: Url,
+    tor: TorConfig,
 }
 
 impl RelayClient {
@@ -37,7 +38,16 @@ impl RelayClient {
     /// Both `http(s)://` and `ws(s)://` are accepted.
     pub fn new(base: Url) -> Self {
         install_crypto_provider();
-        Self { base }
+        Self {
+            base,
+            tor: TorConfig::direct(),
+        }
+    }
+
+    /// Route this client's connections through Tor according to `tor`.
+    pub fn with_tor(mut self, tor: TorConfig) -> Self {
+        self.tor = tor;
+        self
     }
 
     /// Create a client from a string URL.
@@ -71,26 +81,29 @@ impl RelayClient {
         Ok(url)
     }
 
+    async fn connect(&self, url: &Url) -> Result<BoxWsStream> {
+        tokio::time::timeout(OP_TIMEOUT, ws_connect(url, &self.tor, None))
+            .await
+            .map_err(|_| Error::Timeout)?
+    }
+
     async fn roundtrip(&self, message: &ClientMessage) -> Result<ServerMessage> {
         let url = self.ws_url(None, 0)?;
-        let (mut socket, _) = tokio::time::timeout(OP_TIMEOUT, connect_async(url.as_str()))
-            .await
-            .map_err(|_| Error::Timeout)??;
+        let mut socket = self.connect(&url).await?;
 
         let text = serde_json::to_string(message)?;
-        socket.send(Message::Text(text.into())).await?;
+        send_frame(&mut socket, Message::Text(text.into())).await?;
 
         loop {
-            let next = tokio::time::timeout(OP_TIMEOUT, socket.next())
+            let frame = tokio::time::timeout(OP_TIMEOUT, next_frame(&mut socket))
                 .await
-                .map_err(|_| Error::Timeout)?;
-            match next {
-                Some(Ok(Message::Text(text))) => {
+                .map_err(|_| Error::Timeout)??;
+            match frame {
+                Some(Message::Text(text)) => {
                     return Ok(serde_json::from_str(&text)?);
                 }
-                Some(Ok(Message::Close(_))) | None => return Err(Error::Closed),
-                Some(Ok(_)) => continue,
-                Some(Err(error)) => return Err(Error::Ws(error)),
+                Some(Message::Close(_)) | None => return Err(Error::Closed),
+                Some(_) => continue,
             }
         }
     }
@@ -123,10 +136,7 @@ impl Carrier for RelayClient {
 
     async fn subscribe(&self, mailbox: &[u8; 32], since: u64) -> Result<EventStream> {
         let url = self.ws_url(Some(mailbox), since)?;
-        let (socket, _) = tokio::time::timeout(OP_TIMEOUT, connect_async(url.as_str()))
-            .await
-            .map_err(|_| Error::Timeout)??;
-
+        let socket = self.connect(&url).await?;
         Ok(event_stream(socket))
     }
 
@@ -138,16 +148,14 @@ impl Carrier for RelayClient {
         // Multiplexed subscription: one WebSocket, one `subscribe` message.
         // Keeps request URLs short even with thousands of rotating mailboxes.
         let url = self.ws_url(None, 0)?;
-        let (mut socket, _) = tokio::time::timeout(OP_TIMEOUT, connect_async(url.as_str()))
-            .await
-            .map_err(|_| Error::Timeout)??;
+        let mut socket = self.connect(&url).await?;
 
         let message = ClientMessage::Subscribe {
             mailboxes: mailboxes.to_vec(),
             since,
         };
         let text = serde_json::to_string(&message)?;
-        socket.send(Message::Text(text.into())).await?;
+        send_frame(&mut socket, Message::Text(text.into())).await?;
 
         Ok(event_stream(socket))
     }

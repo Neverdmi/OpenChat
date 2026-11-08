@@ -2,9 +2,9 @@
 
 Обновлено: 2026-11-09
 Ветка: `main`
-Версия: 0.1.20 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.21)
+Версия: 0.1.21 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.22)
 Статус: P4 почти готов (свой релей не развёрнут; default.json заполнен публичными MQTT-брокерами); P5 — CLI и TUI готовы (GUI удалён), осталась упаковка
-Тестов: 95 (+11 oc-tui, вне default-members)
+Тестов: 97 (+15 oc-tui, вне default-members)
 
 > Этот файл — точка входа для ИИ-агентов. Прочитай его и `SPEC.md`
 > перед любыми изменениями. После каждого завершённого этапа обновляй
@@ -90,6 +90,9 @@ openchat/
 ### `oc-transport`
 - `Carrier` trait: `health`, `publish`, `subscribe`, `subscribe_many`.
 - `RelayClient` — WebSocket, TLS через rustls + ring.
+- `socks5.rs` — SOCKS5-клиент + `TorMode` (off/fallback/always) +
+  `TorConfig`; `ws.rs` — WS поверх любого стрима с ручным handshake
+  (direct/Tor единообразно). Пул: `from_urls_with_tor`.
 - `MqttClient` — MQTT 3.1.1 поверх WSS (`mqtts://…`, путь по умолчанию
   `/mqtt`) или нативного TLS (`mqtttls://…`, обычно 8883):
   топик `openchat/v1/<mailbox hex>`, пейлоад — тот же JSON `RelayEvent`,
@@ -158,12 +161,19 @@ openchat/
 - Бинарник `oc-tui` (ratatui + crossterm) — одна программа со всем:
   экран входа в режимах Unlock/Create (F2), генерация пароля (F3,
   `word-word-word-word-1234`), контакты, переписка, invite-панель
-  (`/invite`, Esc), outbox-индикатор.
+  (`/invite`, C — копия OSC52, Esc), меню `/settings`.
+- Настройки в `<home>/settings.json` (не секреты): Tor-режим, fanout,
+  invite при старте. Смена → перезапуск воркера. Tor запускается
+  внешним бинарником `tor` (SOCKS 127.0.0.1:9050, data-dir в home);
+  без бинарника — fail-closed с понятной ошибкой.
 - Фоновая нить владеет `Client` + `RelayPool` (свой tokio-рантайм);
   UI <-> воркер — `std::sync::mpsc` (`WorkerCommand`/`UiEvent`).
 - `--cli` в argv → CLI-режим через `oc_cli::run_cli_from`.
 - Проверен через pty: рендер, создание состояния внутри TUI (F2/F3),
-  invite-панель, чистый выход по Ctrl+C.
+  invite-панель, меню настроек (Tor fail-closed без бинарника),
+  чистый выход по Ctrl+C.
+- Windows exe: `cargo build --release -p oc-tui
+  --target x86_64-pc-windows-msvc` на Windows-машине (тот же TUI).
 
 ---
 
@@ -171,8 +181,9 @@ openchat/
 
 - **PQ**: гибрид `X25519 + ML-KEM-768` с v1. Не откладывать: identity-ключи
   и invite-ссылки долгоживущие, retrofit сломает TOFU.
-- **Tor**: режимы `off`, `fallback`, `always`; реализация на `arti-client`,
-  поддержка `.onion`-релеев. Пока не реализовано.
+- **Tor**: режимы `off`, `fallback`, `always` в настройках TUI;
+  реализация — внешний `tor` + SOCKS5 (fail-closed). Встроенный
+  `arti-client` и `.onion`-релеи — позже (см. `.ideas`).
 - **Платформы**: сначала Linux `x86_64-gnu`, `x86_64-musl`,
   `aarch64-gnu` и Windows `x86_64-msvc`. macOS позже.
 - **Релеи**: встроенный курируемый список + пользовательские.
@@ -209,7 +220,7 @@ cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Ожидаемо: 95 тестов. Ручная проверка релея:
+Ожидаемо: 97 тестов. Ручная проверка релея:
 
 ```bash
 cargo run -p oc-relay -- --listen 127.0.0.1:8080
@@ -343,7 +354,7 @@ curl http://127.0.0.1:8080/health
 - **Агент обязан коммитить и пушить сам** после каждого завершённого шага,
   не спрашивая подтверждения.
 - Не коммитить: `target/`, `.env`, `*.log`, токены, `~/.git-credentials`,
-  `state.enc`.
+  `state.enc`, `.ideas` (локальный бэклог идей, в `.gitignore`).
 - Сообщения коммитов — Conventional Commits:
   `feat(scope): ...`, `fix(scope): ...`, `docs: ...`, `chore: ...`.
 - `.memory` обязателен в git и **не должен** попадать в `.gitignore`.

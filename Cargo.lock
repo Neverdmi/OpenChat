@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "oc-cli"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "clap",
@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "oc-client"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "argon2",
  "base64",
@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "oc-core"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "oc-relay"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "axum",
  "clap",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "oc-transport"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "async-trait",
  "base64",
@@ -1346,6 +1346,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha1 0.10.7",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -1356,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "oc-tui"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "base64",
@@ -1367,12 +1368,14 @@ dependencies = [
  "oc-core",
  "oc-transport",
  "ratatui",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
 [[package]]
 name = "oc-wire"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "base64",
  "hex",

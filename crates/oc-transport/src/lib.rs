@@ -11,6 +11,8 @@ pub mod error;
 pub mod mqtt;
 pub mod pool;
 pub mod relay_list;
+pub mod socks5;
+pub mod ws;
 
 use std::pin::Pin;
 
@@ -23,6 +25,7 @@ pub use client::RelayClient;
 pub use error::{Error, Result};
 pub use mqtt::MqttClient;
 pub use pool::RelayPool;
+pub use socks5::{TorConfig, TorMode};
 
 /// Stream of events delivered by a carrier.
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<RelayEvent>> + Send>>;

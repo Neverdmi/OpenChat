@@ -4,7 +4,7 @@
 
 - Спецификация: [SPEC.md](SPEC.md)
 - Статус: P5 — CLI и TUI готовы (GUI удалён); P4 почти готов (ждёт деплоя публичного релея)
-- Тесты: 95 (+11 в oc-tui)
+- Тесты: 97 (+15 в oc-tui)
 
 ## Что уже работает
 
@@ -63,6 +63,17 @@ cargo build --release -p oc-tui
 musl-бинарник статический (static-pie): один файл, который запускается
 и на musl-, и на glibc-системах — самый простой вариант для раздачи
 друзьям. Бинарники: `target/<target>/release/oc-tui`.
+
+Для Windows (exe с тем же TUI-интерфейсом) — на Windows-машине:
+
+```powershell
+cargo build --release -p oc-tui --target x86_64-pc-windows-msvc
+# бинарник: target\x86_64-pc-windows-msvc\release\oc-tui.exe
+```
+
+На Linux musl-хосте windows-таргет не собирается (нужен MSVC-линкер);
+musl-бинарник под Windows не работает — для Windows нужен именно
+windows-таргет на Windows или с mingw-кроссом.
 
 Тесты и проверки:
 
@@ -145,7 +156,13 @@ OPENCHAT_PASSPHRASE='alice-passphrase' ./target/debug/oc --home /tmp/alice chat 
   в буфер через OSC 52, Esc — закрыть; вручную выделять длинный текст
   не нужно);
 - `/add <invite>` (или вставить `openchat://…`) — добавить контакт;
+- `/settings` — меню настроек: Tor-режим (`off`/`fallback`/`always`,
+  нужен установленный `tor`), fanout, invite при старте;
 - `/contacts`, `/flush`, `/help`, `/quit`; `Ctrl+C` — выход.
+
+Tor-режим: `always` гонит весь трафик через Tor SOCKS5 и падает
+закрыто (без прямого соединения), если Tor недоступен; `fallback`
+пробует напрямую и только при ошибке идёт через Tor.
 
 GUI-версия (egui) удалена: TUI оказался удобнее, в одной программе
 остаются только TUI и CLI.

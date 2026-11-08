@@ -35,9 +35,11 @@ use futures_util::{SinkExt, StreamExt};
 use oc_core::random_array;
 use oc_wire::RelayEvent;
 use tokio::io::AsyncReadExt;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
+
+use crate::socks5::{connect_tcp_mode, TorConfig};
+use crate::ws::{ws_connect, BoxWsStream};
 
 use crate::{Carrier, Error, EventStream, Result};
 
@@ -61,9 +63,7 @@ const OP_PINGRESP: u8 = 13;
 /// Topic prefix for every mailbox.
 pub const TOPIC_PREFIX: &str = "openchat/v1/";
 
-type WsSocket = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsSocket = BoxWsStream;
 type TlsSocket = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
 
 /// One MQTT connection, either over WebSocket or native TLS TCP.
@@ -154,6 +154,7 @@ async fn read_tls_packet(socket: &mut TlsSocket) -> Result<Option<Vec<u8>>> {
 #[derive(Debug, Clone)]
 pub struct MqttClient {
     base: Url,
+    tor: TorConfig,
 }
 
 impl MqttClient {
@@ -168,7 +169,16 @@ impl MqttClient {
         // the WebSocket path installs it too, this keeps MQTT usable
         // on its own.
         crate::client::install_crypto_provider();
-        Self { base }
+        Self {
+            base,
+            tor: TorConfig::direct(),
+        }
+    }
+
+    /// Route this client's connections through Tor according to `tor`.
+    pub fn with_tor(mut self, tor: TorConfig) -> Self {
+        self.tor = tor;
+        self
     }
 
     /// Whether this endpoint uses native TLS instead of WebSocket framing.
@@ -232,32 +242,10 @@ impl MqttClient {
     async fn connect_ws(&self) -> Result<WsSocket> {
         let url = self.ws_url()?;
         // MQTT over WebSocket requires the `mqtt` subprotocol; strict
-        // brokers (e.g. Mosquitto) reject upgrades without it. A manual
-        // request must carry every WebSocket upgrade header itself —
-        // tungstenite only generates them for `&str` URLs.
-        use base64::Engine;
-        let key = base64::engine::general_purpose::STANDARD.encode(random_array::<16>());
-        let host = url
-            .host_str()
-            .ok_or_else(|| Error::Url("mqtt endpoint has no host".into()))?;
-        let host_header = match url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_string(),
-        };
-        let request = tokio_tungstenite::tungstenite::http::Request::builder()
-            .uri(url.as_str())
-            .header("Host", host_header)
-            .header("Upgrade", "websocket")
-            .header("Connection", "Upgrade")
-            .header("Sec-WebSocket-Key", key)
-            .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Protocol", "mqtt")
-            .body(())
-            .map_err(|error| Error::Url(error.to_string()))?;
-        let (socket, _) = tokio::time::timeout(OP_TIMEOUT, connect_async(request))
+        // brokers (e.g. Mosquitto) reject upgrades without it.
+        tokio::time::timeout(OP_TIMEOUT, ws_connect(&url, &self.tor, Some("mqtt")))
             .await
-            .map_err(|_| Error::Timeout)??;
-        Ok(socket)
+            .map_err(|_| Error::Timeout)?
     }
 
     async fn connect_tls(&self) -> Result<TlsSocket> {
@@ -269,13 +257,9 @@ impl MqttClient {
         let port = self.base.port().unwrap_or(8883);
         let server_name = rustls::pki_types::ServerName::try_from(host.clone())
             .map_err(|_| Error::Url("invalid mqtt host".into()))?;
-        let tcp = tokio::time::timeout(
-            OP_TIMEOUT,
-            tokio::net::TcpStream::connect((host.as_str(), port)),
-        )
-        .await
-        .map_err(|_| Error::Timeout)?
-        .map_err(|error| Error::Relay(format!("tcp connect: {error}")))?;
+        let tcp = tokio::time::timeout(OP_TIMEOUT, connect_tcp_mode(&self.tor, &host, port))
+            .await
+            .map_err(|_| Error::Timeout)??;
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let config = rustls::ClientConfig::builder()
