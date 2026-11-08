@@ -48,7 +48,8 @@ async fn two_clients_exchange_text_through_a_relay() {
         .listen_once(&pool, Duration::from_millis(500), 0)
         .await
         .unwrap();
-    assert!(incoming.is_empty());
+    assert!(incoming.messages.is_empty());
+    assert_eq!(incoming.added_contacts, vec![alice_id]);
     assert!(bob.contact(&alice_id).is_some());
     assert!(!bob.contact(&alice_id).unwrap().verified);
     assert!(alice.contact(&bob_id).unwrap().verified);
@@ -64,11 +65,20 @@ async fn two_clients_exchange_text_through_a_relay() {
         .listen_once(&pool, Duration::from_millis(500), 0)
         .await
         .unwrap();
-    assert_eq!(incoming.len(), 1);
-    assert_eq!(incoming[0].peer_id, alice_id);
-    assert_eq!(incoming[0].msg_id, sent.msg_id);
-    assert_eq!(incoming[0].text, "привет, боб");
+    assert_eq!(incoming.messages.len(), 1);
+    assert_eq!(incoming.messages[0].peer_id, alice_id);
+    assert_eq!(incoming.messages[0].msg_id, sent.msg_id);
+    assert_eq!(incoming.messages[0].text, "привет, боб");
     assert!(bob.contact(&alice_id).unwrap().verified);
+
+    // Bob acknowledged the message; Alice sees the receipt.
+    let acks = alice
+        .listen_once(&pool, Duration::from_millis(500), 0)
+        .await
+        .unwrap();
+    assert_eq!(acks.acks.len(), 1);
+    assert_eq!(acks.acks[0].acked_msg_id, sent.msg_id);
+    assert!(alice.is_acked(&bob_id, &sent.msg_id));
 
     // Bob replies; Alice's ratchet performs its first DH ratchet.
     let reply = bob
@@ -79,16 +89,22 @@ async fn two_clients_exchange_text_through_a_relay() {
         .listen_once(&pool, Duration::from_millis(500), 0)
         .await
         .unwrap();
-    assert_eq!(incoming.len(), 1);
-    assert_eq!(incoming[0].msg_id, reply.msg_id);
-    assert_eq!(incoming[0].text, "привет, алиса");
+    assert_eq!(incoming.messages.len(), 1);
+    assert_eq!(incoming.messages[0].msg_id, reply.msg_id);
+    assert_eq!(incoming.messages[0].text, "привет, алиса");
 
-    // Replaying stored relay events must not duplicate messages.
+    // Replaying stored relay events must not duplicate messages. Bob also
+    // receives Alice's acknowledgement for his reply.
     let incoming = bob
         .listen_once(&pool, Duration::from_millis(500), 0)
         .await
         .unwrap();
-    assert!(incoming.is_empty(), "duplicate delivery was not suppressed");
+    assert!(
+        incoming.messages.is_empty(),
+        "duplicate delivery was not suppressed"
+    );
+    assert_eq!(incoming.acks.len(), 1);
+    assert_eq!(incoming.acks[0].acked_msg_id, reply.msg_id);
 }
 
 #[tokio::test]
@@ -121,14 +137,14 @@ async fn state_and_sessions_survive_restart() {
             .listen_once(&pool, Duration::from_millis(500), 0)
             .await
             .unwrap();
-        assert_eq!(incoming[0].text, "before restart");
+        assert_eq!(incoming.messages[0].text, "before restart");
 
         bob.send_text(&alice_id, "ack", &pool, 1).await.unwrap();
         let incoming = alice
             .listen_once(&pool, Duration::from_millis(500), 0)
             .await
             .unwrap();
-        assert_eq!(incoming[0].text, "ack");
+        assert_eq!(incoming.messages[0].text, "ack");
 
         (alice_id, bob_id)
     };
@@ -150,6 +166,70 @@ async fn state_and_sessions_survive_restart() {
         .listen_once(&pool, Duration::from_millis(500), 0)
         .await
         .unwrap();
-    assert_eq!(incoming.len(), 1);
-    assert_eq!(incoming[0].text, "after restart");
+    assert_eq!(incoming.messages.len(), 1);
+    assert_eq!(incoming.messages[0].text, "after restart");
+}
+
+#[tokio::test]
+async fn offline_messages_deliver_and_are_acknowledged_after_reconnect() {
+    // Reserve a port, then release it so the first publishes hit a closed
+    // port instead of a hanging server.
+    let address = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    };
+    let url = format!("http://{address}");
+    let pool = RelayPool::from_urls([url.clone()]).unwrap();
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    let mut alice = client(alice_dir.path(), "alice-passphrase", &url);
+    let mut bob = client(bob_dir.path(), "bob-passphrase", &url);
+
+    let alice_id = alice.peer_id().unwrap();
+    let bob_id = bob.peer_id().unwrap();
+
+    // Relay is down: both the handshake and the text stay in the outbox.
+    let invite = bob.invite().unwrap();
+    let summary = alice.add_invite(&invite, &pool, 1).await.unwrap();
+    assert!(summary.queued);
+    assert_eq!(alice.outbox().len(), 1);
+
+    let sent = alice
+        .send_text(&bob_id, "offline hello", &pool, 1)
+        .await
+        .unwrap();
+    assert!(sent.queued);
+    assert_eq!(alice.outbox().len(), 2);
+
+    // Network returns.
+    let listener = TcpListener::bind(address).await.unwrap();
+    let relay = Relay::new(RelayConfig::default());
+    tokio::spawn(async move {
+        let _ = relay.serve(listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let delivered = alice.flush_outbox(&pool, 1).await.unwrap();
+    assert_eq!(delivered, 2);
+    assert!(alice.outbox().is_empty());
+
+    // Bob processes the handshake, then the text from the same replay.
+    let incoming = bob
+        .listen_once(&pool, Duration::from_millis(500), 0)
+        .await
+        .unwrap();
+    assert_eq!(incoming.added_contacts, vec![alice_id]);
+    assert_eq!(incoming.messages.len(), 1);
+    assert_eq!(incoming.messages[0].text, "offline hello");
+    assert_eq!(incoming.messages[0].msg_id, sent.msg_id);
+
+    // Bob's acknowledgement reaches Alice.
+    let incoming = alice
+        .listen_once(&pool, Duration::from_millis(500), 0)
+        .await
+        .unwrap();
+    assert_eq!(incoming.acks.len(), 1);
+    assert_eq!(incoming.acks[0].acked_msg_id, sent.msg_id);
+    assert!(alice.is_acked(&bob_id, &sent.msg_id));
 }

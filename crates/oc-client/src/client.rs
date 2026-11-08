@@ -14,8 +14,8 @@ use oc_transport::RelayPool;
 use oc_wire::RelayEvent;
 
 use crate::invite::Invite;
-use crate::message::{Envelope, TextBody};
-use crate::state::{ClientState, ContactRecord, created_now, new_contact};
+use crate::message::{AckBody, Body, Envelope, TextBody};
+use crate::state::{ClientState, ContactRecord, OutboxRecord, created_now, new_contact};
 use crate::store::StateStore;
 use crate::{Error, Result};
 
@@ -25,6 +25,10 @@ pub const DEFAULT_FANOUT: usize = 3;
 pub const MESSAGE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// Lifetime of a queued handshake on relays.
 pub const HANDSHAKE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// First retry delay for a queued event.
+pub const OUTBOX_BASE_DELAY_SECONDS: u64 = 5;
+/// Upper bound for the exponential retry delay.
+pub const OUTBOX_MAX_DELAY_SECONDS: u64 = 300;
 
 /// Summary returned after adding a contact.
 #[derive(Clone, Debug)]
@@ -35,6 +39,8 @@ pub struct ContactSummary {
     pub safety_number: [u8; 32],
     /// Number of relays that accepted the handshake.
     pub delivered: usize,
+    /// Whether the handshake is still waiting in the outbox.
+    pub queued: bool,
 }
 
 /// Result of sending one text message.
@@ -44,6 +50,8 @@ pub struct SentMessage {
     pub msg_id: [u8; 16],
     /// Number of relays that accepted the event.
     pub delivered: usize,
+    /// Whether the message is still waiting in the outbox.
+    pub queued: bool,
 }
 
 /// A decrypted incoming message.
@@ -59,6 +67,26 @@ pub struct ReceivedMessage {
     pub text: String,
 }
 
+/// A delivery acknowledgement from a peer.
+#[derive(Clone, Debug)]
+pub struct ReceivedAck {
+    /// Peer that confirmed decryption.
+    pub peer_id: [u8; 32],
+    /// Message id that was decrypted.
+    pub acked_msg_id: [u8; 16],
+}
+
+/// Everything that happened during one receive pass.
+#[derive(Clone, Debug, Default)]
+pub struct ListenOutcome {
+    /// Decrypted text messages, in arrival order.
+    pub messages: Vec<ReceivedMessage>,
+    /// Delivery acknowledgements.
+    pub acks: Vec<ReceivedAck>,
+    /// Contacts learned from successful handshakes.
+    pub added_contacts: Vec<[u8; 32]>,
+}
+
 #[derive(Clone)]
 enum MailboxRef {
     Handshake { secret: [u8; 32] },
@@ -70,7 +98,8 @@ type SubscriptionMap = HashMap<[u8; 32], MailboxRef>;
 enum Processed {
     Ignored,
     Message(ReceivedMessage),
-    ContactAdded,
+    Ack(ReceivedAck),
+    ContactAdded([u8; 32]),
 }
 
 /// OpenChat client: encrypted state plus protocol operations.
@@ -198,21 +227,39 @@ impl Client {
         let padded = frame::pad(&initiation.to_bytes())?;
         let inner = Envelope::handshake(padded).encode();
         let sealed = seal::seal(&invite.bundle.signed_prekey, &inner)?;
-        let event = RelayEvent::new(invite.bundle.signed_prekey, sealed, HANDSHAKE_TTL_SECONDS);
-        let delivered = pool.publish(&event, fanout.max(1)).await?;
+        let now = now_unix();
+        let record = OutboxRecord {
+            msg_id: random_array::<16>(),
+            peer_id: invite.peer_id,
+            mailbox: invite.bundle.signed_prekey,
+            payload: sealed,
+            created_at: now,
+            expires_at: now.saturating_add(HANDSHAKE_TTL_SECONDS),
+            attempts: 0,
+            next_attempt_at: 0,
+        };
 
         self.state.upsert_contact(contact);
         self.state.add_relays(invite.relays);
+        self.state.enqueue_outbox(record.clone());
+        self.save()?;
+        let delivered = self.try_deliver(&record, pool, fanout).await;
         self.save()?;
 
         Ok(ContactSummary {
             peer_id: invite.peer_id,
             safety_number: safety,
             delivered,
+            queued: delivered == 0,
         })
     }
 
     /// Encrypt and publish one text message.
+    ///
+    /// The ciphertext is written to the outbox before the first publish
+    /// attempt, so a relay outage never loses a message that already advanced
+    /// the ratchet. If every relay is unreachable the message stays queued and
+    /// `queued` is set.
     pub async fn send_text(
         &mut self,
         peer_id: &[u8; 32],
@@ -220,22 +267,100 @@ impl Client {
         pool: &RelayPool,
         fanout: usize,
     ) -> Result<SentMessage> {
+        let body = TextBody::new(text)?;
+        let msg_id = body.msg_id;
+        let record = self.seal_body(peer_id, &Body::Text(body), MESSAGE_TTL_SECONDS)?;
+
+        self.state.enqueue_outbox(record.clone());
+        self.save()?;
+        let delivered = self.try_deliver(&record, pool, fanout).await;
+        self.save()?;
+
+        Ok(SentMessage {
+            msg_id,
+            delivered,
+            queued: delivered == 0,
+        })
+    }
+
+    /// Outgoing events still waiting for a relay.
+    pub fn outbox(&self) -> &[OutboxRecord] {
+        &self.state.outbox
+    }
+
+    /// Whether the peer confirmed decrypting a message.
+    pub fn is_acked(&self, peer_id: &[u8; 32], msg_id: &[u8; 16]) -> bool {
+        self.state.acked(peer_id, msg_id)
+    }
+
+    /// Retry every queued event now, ignoring backoff timers.
+    pub async fn flush_outbox(&mut self, pool: &RelayPool, fanout: usize) -> Result<usize> {
+        self.flush_outbox_inner(pool, fanout, false).await
+    }
+
+    /// Retry queued events whose backoff timer has elapsed.
+    pub async fn flush_due_outbox(&mut self, pool: &RelayPool, fanout: usize) -> Result<usize> {
+        self.flush_outbox_inner(pool, fanout, true).await
+    }
+
+    async fn flush_outbox_inner(
+        &mut self,
+        pool: &RelayPool,
+        fanout: usize,
+        only_due: bool,
+    ) -> Result<usize> {
+        let now = now_unix();
+        self.state.prune_outbox(now);
+
+        let due: Vec<OutboxRecord> = self
+            .state
+            .outbox
+            .iter()
+            .filter(|record| !only_due || record.next_attempt_at <= now)
+            .cloned()
+            .collect();
+
+        let mut delivered = 0usize;
+        for record in due {
+            if self.try_deliver(&record, pool, fanout).await > 0 {
+                delivered += 1;
+                continue;
+            }
+            if let Some(entry) = self
+                .state
+                .outbox
+                .iter_mut()
+                .find(|entry| entry.msg_id == record.msg_id && entry.peer_id == record.peer_id)
+            {
+                entry.attempts = entry.attempts.saturating_add(1);
+                let shift = entry.attempts.min(6);
+                let delay = OUTBOX_BASE_DELAY_SECONDS
+                    .saturating_mul(1u64 << shift)
+                    .min(OUTBOX_MAX_DELAY_SECONDS);
+                entry.next_attempt_at = now.saturating_add(delay);
+            }
+        }
+
+        self.save()?;
+        Ok(delivered)
+    }
+
+    /// Seal one application body into the peer's inbox and update the ratchet.
+    fn seal_body(&mut self, peer_id: &[u8; 32], body: &Body, ttl: u64) -> Result<OutboxRecord> {
         let my_peer_id = self.state.peer_id()?;
         let contact = self.state.contact(peer_id).ok_or(Error::UnknownContact)?;
 
-        let body = TextBody::new(text)?;
         let padded = frame::pad(&body.encode()?)?;
-
         let mut ratchet = Ratchet::from_snapshot(contact.ratchet.clone())?;
         let (header, ciphertext) = match ratchet.encrypt(&padded) {
             Ok(result) => result,
             Err(oc_core::Error::RatchetState) => return Err(Error::SessionNotReady),
             Err(error) => return Err(Error::Core(error)),
         };
-
         let inner = Envelope::text(header, ciphertext).encode();
+
         let epoch = mailbox::epoch_of(now_unix());
-        let (mailbox_root, peer) = (contact.mailbox_root, contact.peer_id);
+        let mailbox_root = contact.mailbox_root;
         let slot = {
             let contact = self
                 .state
@@ -245,41 +370,72 @@ impl Client {
         };
 
         // Peer's inbox: owner = peer, sender = self.
-        let chain = MailboxChain::derive(&mailbox_root, &peer, &my_peer_id);
-        let mailbox_pk = chain.slot_public(epoch, slot);
-        let sealed = seal::seal(&mailbox_pk, &inner)?;
+        let chain = MailboxChain::derive(&mailbox_root, peer_id, &my_peer_id);
+        let mailbox = chain.slot_public(epoch, slot);
+        let payload = seal::seal(&mailbox, &inner)?;
 
-        let event = RelayEvent::new(mailbox_pk, sealed, MESSAGE_TTL_SECONDS);
-        let delivered = pool.publish(&event, fanout.max(1)).await?;
-
+        let msg_id = body.msg_id();
         let contact = self
             .state
             .contact_mut(peer_id)
             .ok_or(Error::UnknownContact)?;
         contact.ratchet = ratchet.snapshot();
-        self.state.mark_seen(peer_id, &body.msg_id);
-        self.save()?;
+        self.state.mark_seen(peer_id, &msg_id);
 
-        Ok(SentMessage {
-            msg_id: body.msg_id,
-            delivered,
+        let now = now_unix();
+        Ok(OutboxRecord {
+            msg_id,
+            peer_id: *peer_id,
+            mailbox,
+            payload,
+            created_at: now,
+            expires_at: now.saturating_add(ttl),
+            attempts: 0,
+            next_attempt_at: 0,
         })
+    }
+
+    /// Publish one queued record and remove it on success.
+    async fn try_deliver(
+        &mut self,
+        record: &OutboxRecord,
+        pool: &RelayPool,
+        fanout: usize,
+    ) -> usize {
+        let event = RelayEvent {
+            mailbox: record.mailbox,
+            created_at: record.created_at,
+            expires_at: record.expires_at,
+            payload: record.payload.clone(),
+        };
+        match pool.publish(&event, fanout.max(1)).await {
+            Ok(delivered) => {
+                self.state.remove_outbox(&record.peer_id, &record.msg_id);
+                delivered
+            }
+            Err(_) => 0,
+        }
     }
 
     /// Receive and decrypt available events, returning after `idle` with no
     /// new events.
+    ///
+    /// Queued outgoing events are retried first, and every newly decrypted
+    /// message is acknowledged back to the sender.
     pub async fn listen_once(
         &mut self,
         pool: &RelayPool,
         idle: Duration,
         since: u64,
-    ) -> Result<Vec<ReceivedMessage>> {
-        let mut received = Vec::new();
+    ) -> Result<ListenOutcome> {
+        let _ = self.flush_due_outbox(pool, DEFAULT_FANOUT).await?;
+        let mut outcome = ListenOutcome::default();
+        let mut pending_acks: Vec<([u8; 32], [u8; 16])> = Vec::new();
 
         loop {
             let (mailboxes, map) = self.subscriptions()?;
             if mailboxes.is_empty() {
-                return Ok(received);
+                break;
             }
 
             let mut stream = pool.subscribe_all_many(&mailboxes, since).await?;
@@ -289,13 +445,24 @@ impl Client {
                 match tokio::time::timeout(idle, stream.next()).await {
                     Err(_) => break,
                     Ok(None) => break,
-                    Ok(Some(Err(error))) => return Err(error.into()),
+                    // Resilient pool streams reconnect internally. If a
+                    // non-recoverable error surfaces, rebuild the subscription
+                    // instead of failing the whole listen pass.
+                    Ok(Some(Err(_))) => break,
                     Ok(Some(Ok(event))) => match self.process_event(&map, &event)? {
                         Processed::Ignored => {}
-                        Processed::Message(message) => received.push(message),
-                        Processed::ContactAdded => {
+                        Processed::Message(message) => {
+                            let target = (message.peer_id, message.msg_id);
+                            if !pending_acks.contains(&target) {
+                                pending_acks.push(target);
+                            }
+                            outcome.messages.push(message);
+                        }
+                        Processed::Ack(ack) => outcome.acks.push(ack),
+                        Processed::ContactAdded(peer_id) => {
                             // New contact means new inbox mailboxes: rebuild
                             // the subscription and replay from the relay.
+                            outcome.added_contacts.push(peer_id);
                             restart = true;
                             break;
                         }
@@ -308,7 +475,32 @@ impl Client {
             }
         }
 
-        Ok(received)
+        for (peer_id, msg_id) in pending_acks {
+            self.send_ack(&peer_id, &msg_id, pool, DEFAULT_FANOUT)
+                .await?;
+        }
+
+        Ok(outcome)
+    }
+
+    /// Encrypt and queue a delivery acknowledgement.
+    async fn send_ack(
+        &mut self,
+        peer_id: &[u8; 32],
+        acked_msg_id: &[u8; 16],
+        pool: &RelayPool,
+        fanout: usize,
+    ) -> Result<()> {
+        let record = self.seal_body(
+            peer_id,
+            &Body::Ack(AckBody::new(*acked_msg_id)),
+            MESSAGE_TTL_SECONDS,
+        )?;
+        self.state.enqueue_outbox(record.clone());
+        self.save()?;
+        let _ = self.try_deliver(&record, pool, fanout).await;
+        self.save()?;
+        Ok(())
     }
 
     fn subscriptions(&self) -> Result<(Vec<[u8; 32]>, SubscriptionMap)> {
@@ -431,7 +623,7 @@ impl Client {
         );
         self.state.upsert_contact(contact);
         self.save()?;
-        Ok(Processed::ContactAdded)
+        Ok(Processed::ContactAdded(peer_id))
     }
 
     fn process_text(
@@ -459,14 +651,15 @@ impl Client {
             Ok(body) => body,
             Err(_) => return Ok(Processed::Ignored),
         };
-        let body = match TextBody::decode(body_bytes) {
+        let body = match Body::decode(body_bytes) {
             Ok(body) => body,
             Err(_) => return Ok(Processed::Ignored),
         };
 
         // A successful ratchet decrypt proves the peer holds the private
         // identity key behind the pinned public keys.
-        let already_seen = self.state.seen(peer_id, &body.msg_id);
+        let msg_id = body.msg_id();
+        let already_seen = self.state.seen(peer_id, &msg_id);
         let contact = self
             .state
             .contact_mut(peer_id)
@@ -482,15 +675,26 @@ impl Client {
         }
 
         contact.ratchet = ratchet.snapshot();
-        self.state.mark_seen(peer_id, &body.msg_id);
-        self.save()?;
+        self.state.mark_seen(peer_id, &msg_id);
 
-        Ok(Processed::Message(ReceivedMessage {
-            peer_id: *peer_id,
-            msg_id: body.msg_id,
-            timestamp_ms: body.timestamp_ms,
-            text: body.text,
-        }))
+        let processed = match body {
+            Body::Text(body) => Processed::Message(ReceivedMessage {
+                peer_id: *peer_id,
+                msg_id: body.msg_id,
+                timestamp_ms: body.timestamp_ms,
+                text: body.text,
+            }),
+            Body::Ack(ack) => {
+                self.state.mark_acked(peer_id, &ack.acked_msg_id);
+                Processed::Ack(ReceivedAck {
+                    peer_id: *peer_id,
+                    acked_msg_id: ack.acked_msg_id,
+                })
+            }
+        };
+
+        self.save()?;
+        Ok(processed)
     }
 }
 

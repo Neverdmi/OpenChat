@@ -18,8 +18,10 @@ pub mod message;
 pub mod state;
 pub mod store;
 
-pub use client::{Client, ContactSummary, ReceivedMessage, SentMessage};
+pub use client::{
+    Client, ContactSummary, ListenOutcome, ReceivedAck, ReceivedMessage, SentMessage,
+};
 pub use error::{Error, Result};
 pub use invite::Invite;
-pub use state::{ClientState, ContactRecord};
+pub use state::{ClientState, ContactRecord, OutboxRecord};
 pub use store::StateStore;

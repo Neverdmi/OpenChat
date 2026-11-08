@@ -19,6 +19,47 @@ pub const STATE_VERSION: u32 = 1;
 pub const IDENTITY_LEN: usize = 64;
 /// Maximum number of remembered message ids.
 pub const SEEN_CAPACITY: usize = 4096;
+/// Maximum number of queued outgoing messages.
+pub const OUTBOX_CAPACITY: usize = 1024;
+/// Maximum number of remembered delivery acknowledgements.
+pub const ACK_CAPACITY: usize = 4096;
+
+/// One outgoing event waiting to be accepted by a relay.
+///
+/// The payload is already ratchet-encrypted and sealed to a mailbox, so a
+/// retry republishes exactly the same bytes and never advances the ratchet.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OutboxRecord {
+    /// Message id of the application body inside the envelope.
+    pub msg_id: [u8; 16],
+    /// Conversation partner.
+    pub peer_id: [u8; 32],
+    /// Mailbox the sealed payload is addressed to.
+    pub mailbox: [u8; 32],
+    /// Sealed envelope bytes, opaque to the relay.
+    pub payload: Vec<u8>,
+    /// UNIX seconds when the event was created.
+    pub created_at: u64,
+    /// UNIX seconds after which the event may be dropped.
+    pub expires_at: u64,
+    /// Number of publish attempts so far.
+    #[serde(default)]
+    pub attempts: u32,
+    /// UNIX seconds before which the next automatic retry should wait.
+    #[serde(default)]
+    pub next_attempt_at: u64,
+}
+
+impl core::fmt::Debug for OutboxRecord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OutboxRecord")
+            .field("msg_id", &hex::encode(self.msg_id))
+            .field("peer_id", &hex::encode(self.peer_id))
+            .field("created_at", &self.created_at)
+            .field("attempts", &self.attempts)
+            .finish_non_exhaustive()
+    }
+}
 
 /// One conversation partner.
 #[derive(Clone, Serialize, Deserialize)]
@@ -95,6 +136,13 @@ pub struct ClientState {
     pub contacts: Vec<ContactRecord>,
     /// Recently seen message ids (`hex(peer_id) || hex(msg_id)`).
     pub seen: VecDeque<String>,
+    /// Outgoing events not yet accepted by any relay.
+    #[serde(default)]
+    pub outbox: Vec<OutboxRecord>,
+    /// Recently received delivery acknowledgements
+    /// (`hex(peer_id) || hex(msg_id)`).
+    #[serde(default)]
+    pub acks: VecDeque<String>,
 }
 
 impl core::fmt::Debug for ClientState {
@@ -104,6 +152,8 @@ impl core::fmt::Debug for ClientState {
             .field("relays", &self.relays.len())
             .field("contacts", &self.contacts.len())
             .field("seen", &self.seen.len())
+            .field("outbox", &self.outbox.len())
+            .field("acks", &self.acks.len())
             .finish_non_exhaustive()
     }
 }
@@ -121,6 +171,8 @@ impl ClientState {
             relays,
             contacts: Vec::new(),
             seen: VecDeque::new(),
+            outbox: Vec::new(),
+            acks: VecDeque::new(),
         })
     }
 
@@ -197,6 +249,52 @@ impl ClientState {
             self.seen.pop_front();
         }
         self.seen.push_back(key);
+    }
+
+    /// Queue an outgoing event, replacing an existing record for the same id.
+    pub fn enqueue_outbox(&mut self, record: OutboxRecord) {
+        if let Some(existing) = self
+            .outbox
+            .iter_mut()
+            .find(|existing| existing.msg_id == record.msg_id && existing.peer_id == record.peer_id)
+        {
+            *existing = record;
+            return;
+        }
+        if self.outbox.len() >= OUTBOX_CAPACITY {
+            self.outbox.remove(0);
+        }
+        self.outbox.push(record);
+    }
+
+    /// Remove one outgoing event after a relay accepted it.
+    pub fn remove_outbox(&mut self, peer_id: &[u8; 32], msg_id: &[u8; 16]) -> bool {
+        let before = self.outbox.len();
+        self.outbox
+            .retain(|record| record.peer_id != *peer_id || record.msg_id != *msg_id);
+        self.outbox.len() != before
+    }
+
+    /// Drop expired outgoing events.
+    pub fn prune_outbox(&mut self, now: u64) {
+        self.outbox.retain(|record| record.expires_at > now);
+    }
+
+    /// Whether the peer confirmed decrypting a message.
+    pub fn acked(&self, peer_id: &[u8; 32], msg_id: &[u8; 16]) -> bool {
+        self.acks.contains(&seen_key(peer_id, msg_id))
+    }
+
+    /// Remember a delivery acknowledgement.
+    pub fn mark_acked(&mut self, peer_id: &[u8; 32], msg_id: &[u8; 16]) {
+        let key = seen_key(peer_id, msg_id);
+        if self.acks.contains(&key) {
+            return;
+        }
+        if self.acks.len() >= ACK_CAPACITY {
+            self.acks.pop_front();
+        }
+        self.acks.push_back(key);
     }
 
     /// Merge relay URLs, preserving order and dropping duplicates.
@@ -326,6 +424,41 @@ mod tests {
         }
         assert!(state.seen.len() <= SEEN_CAPACITY);
         assert!(!state.seen(&peer_a, &msg));
+    }
+
+    #[test]
+    fn outbox_and_acknowledgements_are_deduplicated() {
+        let mut state = ClientState::generate(Vec::new()).unwrap();
+        let peer = [1u8; 32];
+        let record = OutboxRecord {
+            msg_id: [2u8; 16],
+            peer_id: peer,
+            mailbox: [3u8; 32],
+            payload: vec![4, 5, 6],
+            created_at: 10,
+            expires_at: 20,
+            attempts: 0,
+            next_attempt_at: 0,
+        };
+
+        state.enqueue_outbox(record.clone());
+        state.enqueue_outbox(record.clone());
+        assert_eq!(state.outbox.len(), 1);
+
+        state.prune_outbox(19);
+        assert_eq!(state.outbox.len(), 1);
+        state.prune_outbox(21);
+        assert!(state.outbox.is_empty());
+
+        state.enqueue_outbox(record.clone());
+        assert!(state.remove_outbox(&peer, &record.msg_id));
+        assert!(!state.remove_outbox(&peer, &record.msg_id));
+
+        assert!(!state.acked(&peer, &[9u8; 16]));
+        state.mark_acked(&peer, &[9u8; 16]);
+        state.mark_acked(&peer, &[9u8; 16]);
+        assert!(state.acked(&peer, &[9u8; 16]));
+        assert_eq!(state.acks.len(), 1);
     }
 
     #[test]

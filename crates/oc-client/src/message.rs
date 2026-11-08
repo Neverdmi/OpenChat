@@ -12,9 +12,13 @@ pub const KIND_HANDSHAKE: u8 = 1;
 pub const KIND_TEXT: u8 = 2;
 /// Frame body type: text.
 pub const TYPE_TEXT: u8 = 1;
+/// Frame body type: delivery acknowledgement.
+pub const TYPE_ACK: u8 = 2;
 
 const BODY_HEADER_LEN: usize = 4 + 16 + 8 + 2;
 const ENVELOPE_HEADER_LEN: usize = 2;
+/// Serialized length of an acknowledgement body.
+pub const ACK_BODY_LEN: usize = BODY_HEADER_LEN + 16;
 
 /// Maximum UTF-8 text length in one frame.
 pub const MAX_TEXT_BYTES: usize = 4096;
@@ -49,36 +53,21 @@ impl TextBody {
         let body_len = u16::try_from(body.len()).map_err(|_| Error::TextTooLong(MAX_TEXT_BYTES))?;
 
         let mut out = Vec::with_capacity(BODY_HEADER_LEN + body.len());
-        out.push(PROTOCOL_VERSION);
-        out.push(TYPE_TEXT);
-        out.push(0); // flags, reserved for future use
-        out.push(0); // reserved
-        out.extend_from_slice(&self.msg_id);
-        out.extend_from_slice(&self.timestamp_ms.to_le_bytes());
-        out.extend_from_slice(&body_len.to_le_bytes());
+        encode_header(
+            &mut out,
+            TYPE_TEXT,
+            &self.msg_id,
+            self.timestamp_ms,
+            body_len,
+        );
         out.extend_from_slice(body);
         Ok(out)
     }
 
     /// Parse a body produced by [`TextBody::encode`].
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < BODY_HEADER_LEN {
-            return Err(Error::InvalidMessage);
-        }
-        if bytes[0] != PROTOCOL_VERSION || bytes[1] != TYPE_TEXT {
-            return Err(Error::InvalidMessage);
-        }
-
-        let msg_id: [u8; 16] = bytes[4..20].try_into().expect("length checked");
-        let timestamp_ms = u64::from_le_bytes(bytes[20..28].try_into().expect("length checked"));
-        let body_len =
-            u16::from_le_bytes(bytes[28..30].try_into().expect("length checked")) as usize;
-
-        if BODY_HEADER_LEN + body_len != bytes.len() {
-            return Err(Error::InvalidMessage);
-        }
-
-        let text = core::str::from_utf8(&bytes[BODY_HEADER_LEN..])
+        let (msg_id, timestamp_ms, body) = decode_header(bytes, TYPE_TEXT)?;
+        let text = core::str::from_utf8(body)
             .map_err(|_| Error::InvalidMessage)?
             .to_owned();
 
@@ -88,6 +77,122 @@ impl TextBody {
             text,
         })
     }
+}
+
+/// Delivery acknowledgement (`SPEC.md` §8, `type=ACK`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AckBody {
+    /// Random id of the acknowledgement frame itself.
+    pub msg_id: [u8; 16],
+    /// Sender wall-clock time in milliseconds.
+    pub timestamp_ms: u64,
+    /// Message that was successfully decrypted by the peer.
+    pub acked_msg_id: [u8; 16],
+}
+
+impl AckBody {
+    /// Build an acknowledgement with a fresh `msg_id` and the current time.
+    pub fn new(acked_msg_id: [u8; 16]) -> Self {
+        Self {
+            msg_id: random_array::<16>(),
+            timestamp_ms: now_millis(),
+            acked_msg_id,
+        }
+    }
+
+    /// Serialize; the caller pads it with [`oc_core::frame::pad`].
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ACK_BODY_LEN);
+        encode_header(&mut out, TYPE_ACK, &self.msg_id, self.timestamp_ms, 16);
+        out.extend_from_slice(&self.acked_msg_id);
+        out
+    }
+
+    /// Parse an acknowledgement produced by [`AckBody::encode`].
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let (msg_id, timestamp_ms, body) = decode_header(bytes, TYPE_ACK)?;
+        if body.len() != 16 {
+            return Err(Error::InvalidMessage);
+        }
+        Ok(Self {
+            msg_id,
+            timestamp_ms,
+            acked_msg_id: body.try_into().expect("length checked"),
+        })
+    }
+}
+
+/// Any application body carried by a ratchet frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Body {
+    /// User-visible text.
+    Text(TextBody),
+    /// Delivery acknowledgement.
+    Ack(AckBody),
+}
+
+impl Body {
+    /// Message id of the body.
+    pub fn msg_id(&self) -> [u8; 16] {
+        match self {
+            Self::Text(text) => text.msg_id,
+            Self::Ack(ack) => ack.msg_id,
+        }
+    }
+
+    /// Serialize the body before padding.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::Text(text) => text.encode(),
+            Self::Ack(ack) => Ok(ack.encode()),
+        }
+    }
+
+    /// Parse a padded-and-unpadded body.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 2 {
+            return Err(Error::InvalidMessage);
+        }
+        match bytes[1] {
+            TYPE_TEXT => TextBody::decode(bytes).map(Self::Text),
+            TYPE_ACK => AckBody::decode(bytes).map(Self::Ack),
+            _ => Err(Error::InvalidMessage),
+        }
+    }
+}
+
+fn encode_header(
+    out: &mut Vec<u8>,
+    kind: u8,
+    msg_id: &[u8; 16],
+    timestamp_ms: u64,
+    body_len: u16,
+) {
+    out.push(PROTOCOL_VERSION);
+    out.push(kind);
+    out.push(0); // flags, reserved for future use
+    out.push(0); // reserved
+    out.extend_from_slice(msg_id);
+    out.extend_from_slice(&timestamp_ms.to_le_bytes());
+    out.extend_from_slice(&body_len.to_le_bytes());
+}
+
+fn decode_header(bytes: &[u8], expected_type: u8) -> Result<([u8; 16], u64, &[u8])> {
+    if bytes.len() < BODY_HEADER_LEN {
+        return Err(Error::InvalidMessage);
+    }
+    if bytes[0] != PROTOCOL_VERSION || bytes[1] != expected_type {
+        return Err(Error::InvalidMessage);
+    }
+
+    let msg_id: [u8; 16] = bytes[4..20].try_into().expect("length checked");
+    let timestamp_ms = u64::from_le_bytes(bytes[20..28].try_into().expect("length checked"));
+    let body_len = u16::from_le_bytes(bytes[28..30].try_into().expect("length checked")) as usize;
+
+    if BODY_HEADER_LEN + body_len != bytes.len() {
+        return Err(Error::InvalidMessage);
+    }
+    Ok((msg_id, timestamp_ms, &bytes[BODY_HEADER_LEN..]))
 }
 
 /// Inner envelope, sealed to a mailbox before it touches the relay.
@@ -207,6 +312,25 @@ mod tests {
         let mut wrong_type = body.clone();
         wrong_type[1] = 99;
         assert!(TextBody::decode(&wrong_type).is_err());
+    }
+
+    #[test]
+    fn ack_body_roundtrip_and_body_dispatch() {
+        let ack = AckBody::new([7u8; 16]);
+        let encoded = ack.encode();
+        assert_eq!(encoded.len(), ACK_BODY_LEN);
+        assert_eq!(AckBody::decode(&encoded).unwrap(), ack);
+        assert_eq!(Body::decode(&encoded).unwrap(), Body::Ack(ack));
+
+        let text = TextBody::new("ok").unwrap();
+        assert_eq!(
+            Body::decode(&text.encode().unwrap()).unwrap(),
+            Body::Text(text)
+        );
+
+        let mut wrong = encoded;
+        wrong[1] = TYPE_TEXT;
+        assert!(AckBody::decode(&wrong).is_err());
     }
 
     #[test]

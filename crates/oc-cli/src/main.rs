@@ -79,6 +79,16 @@ enum Command {
 
     /// List contacts.
     Contacts,
+
+    /// Retry every queued outgoing message now.
+    Flush {
+        /// Number of relays to publish to.
+        #[arg(long, default_value_t = 3)]
+        fanout: usize,
+    },
+
+    /// Show messages that have not reached any relay yet.
+    Outbox,
 }
 
 #[tokio::main]
@@ -119,7 +129,11 @@ async fn run() -> Result<()> {
             let summary = client.add_invite(&link, &pool, fanout).await?;
             println!("added:        {}", peer_id_base32(&summary.peer_id));
             println!("safety:       {}", format_safety(&summary.safety_number));
-            println!("handshake:    {} relay(s)", summary.delivered);
+            if summary.queued {
+                println!("handshake:    queued (relay unavailable, will retry)");
+            } else {
+                println!("handshake:    {} relay(s)", summary.delivered);
+            }
             Ok(())
         }
         Command::Send { peer, text, fanout } => {
@@ -129,11 +143,15 @@ async fn run() -> Result<()> {
             let pool = build_pool(client.relays())?;
 
             let sent = client.send_text(&peer_id, &text, &pool, fanout).await?;
+            let state = if sent.queued {
+                "queued (relay unavailable, will retry)".to_string()
+            } else {
+                format!("via {} relay(s)", sent.delivered)
+            };
             println!(
-                "sent {} to {} via {} relay(s)",
+                "sent {} to {} {state}",
                 hex::encode(sent.msg_id),
-                short_peer_id(&peer_id),
-                sent.delivered
+                short_peer_id(&peer_id)
             );
             Ok(())
         }
@@ -143,15 +161,54 @@ async fn run() -> Result<()> {
             let pool = build_pool(client.relays())?;
 
             loop {
-                let messages = client
+                let outcome = client
                     .listen_once(&pool, Duration::from_secs(idle.max(1)), since)
                     .await?;
-                for message in &messages {
+                for peer_id in &outcome.added_contacts {
+                    println!("new contact: {}", short_peer_id(peer_id));
+                }
+                for message in &outcome.messages {
                     println!("{}: {}", short_peer_id(&message.peer_id), message.text);
+                }
+                for ack in &outcome.acks {
+                    println!(
+                        "ack: {} delivered {}",
+                        short_peer_id(&ack.peer_id),
+                        hex::encode(ack.acked_msg_id)
+                    );
                 }
                 if once {
                     break;
                 }
+            }
+            Ok(())
+        }
+        Command::Flush { fanout } => {
+            let passphrase = passphrase(false)?;
+            let mut client = open_client(&args.home, &passphrase)?;
+            let pool = build_pool(client.relays())?;
+            let pending = client.outbox().len();
+            let delivered = client.flush_outbox(&pool, fanout).await?;
+            let remaining = client.outbox().len();
+            println!(
+                "flushed: {delivered} delivered, {remaining} still queued (was {pending})"
+            );
+            Ok(())
+        }
+        Command::Outbox => {
+            let passphrase = passphrase(false)?;
+            let client = open_client(&args.home, &passphrase)?;
+            if client.outbox().is_empty() {
+                println!("outbox is empty");
+            }
+            for record in client.outbox() {
+                println!(
+                    "{}  {}  attempts={}  peer={}",
+                    hex::encode(record.msg_id),
+                    record.created_at,
+                    record.attempts,
+                    short_peer_id(&record.peer_id)
+                );
             }
             Ok(())
         }
