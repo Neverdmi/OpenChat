@@ -3,8 +3,8 @@
 Анонимный текстовый мессенджер на публичной инфраструктуре.
 
 - Спецификация: [SPEC.md](SPEC.md)
-- Статус: P5 начат — интерактивный CLI; P4 почти готов (ждёт деплоя публичного релея)
-- Тесты: 90
+- Статус: P5 — CLI и desktop готовы; P4 почти готов (ждёт деплоя публичного релея)
+- Тесты: 90 (+7 в oc-desktop)
 
 ## Что уже работает
 
@@ -109,6 +109,17 @@ OPENCHAT_PASSPHRASE='alice-passphrase' ./target/debug/oc --home /tmp/alice chat 
 Внутри: текст — отправить, `/peer <prefix>` — сменить собеседника,
 `/help` — справка, `/quit` — выход.
 
+## Desktop
+
+```bash
+cargo run -p oc-desktop            # графический интерфейс (egui)
+cargo run -p oc-desktop -- --cli chat <peer>   # тот же CLI, без смены бинарника
+```
+
+Desktop — отдельный бинарник с нативными X11/Wayland; в musl/static-сборки
+он не входит. Экран разблокировки (каталог + пароль), контакты,
+переписка, добавление по invite.
+
 ## Запуск релея
 
 ```bash
@@ -131,7 +142,8 @@ crates/oc-wire       общие типы протокола релея (JSON)
 crates/oc-transport  Carrier, WebSocket-клиент, пул релеев
 crates/oc-relay      self-hosted релей + бинарник
 crates/oc-client     состояние, invite, сессии, текст, TOFU
-crates/oc-cli        CLI `oc`
+crates/oc-cli        CLI `oc` (библиотека + бинарник)
+crates/oc-desktop    десктоп `oc-desktop` (egui; `--cli` → CLI)
 relays/default.json  встроенный список релеев (пока пуст)
 ```
 

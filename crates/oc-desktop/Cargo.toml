@@ -1,0 +1,20 @@
+[package]
+name = "oc-desktop"
+description = "OpenChat desktop UI (egui); use --cli for the command-line interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "oc-desktop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+eframe = "0.32"
+hex = "0.4"
+oc-cli = { path = "../oc-cli" }
+oc-client = { path = "../oc-client" }
+oc-transport = { path = "../oc-transport" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

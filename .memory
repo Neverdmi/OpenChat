@@ -2,8 +2,8 @@
 
 Обновлено: 2026-11-08
 Ветка: `main`
-Статус: P4 почти готов (остался только деплой публичного релея); P5 начат — интерактивный CLI готов, desktop позже
-Тестов: 90
+Статус: P4 почти готов (остался только деплой публичного релея); P5 — CLI и desktop готовы, остались TUI/упаковка
+Тестов: 90 (+7 в oc-desktop, вне default-members)
 
 > Этот файл — точка входа для ИИ-агентов. Прочитай его и `SPEC.md`
 > перед любыми изменениями. После каждого завершённого этапа обновляй
@@ -34,7 +34,7 @@
 | P2: `oc-wire`, `oc-transport`, `oc-relay` | готово, 18 тестов |
 | P3: `oc-client` + CLI (invite → handshake → текст) | готово, 19 тестов |
 | P4: reconnect, outbox, prekey rotation, default pool, MQTT | **почти готово**: остался только деплой публичного релея |
-| P5: CLI-интерфейс, затем desktop UI (Linux gnu/musl, Windows) | **частично**: интерактивный CLI (`oc chat`) готов; desktop не начат |
+| P5: CLI-интерфейс, затем desktop UI (Linux gnu/musl, Windows) | **частично**: интерактивный CLI (`oc chat`), desktop (`oc-desktop`) готовы; TUI/упаковка — позже |
 | P6: Tor, cover traffic, аудит, mobile | не начато |
 
 Текущее состояние: два клиента через локальный релей обмениваются текстом
@@ -59,7 +59,9 @@ openchat/
     oc-transport/          Carrier, WebSocket-клиент, пул релеев
     oc-relay/              self-hosted релей + бинарь oc-relay
     oc-client/             состояние, invite, сессии, TOFU, текст
-    oc-cli/                CLI `oc`
+    oc-cli/                CLI `oc` (библиотека + тонкий бинарник)
+    oc-desktop/            десктоп `oc-desktop` (egui; `--cli` → тот же CLI);
+                           вне default-members, не входит в musl-сборку
   relays/default.json      встроенный список релеев (пока пуст)
 ```
 
@@ -140,6 +142,18 @@ openchat/
 - Пароль: `OPENCHAT_PASSPHRASE` или `rpassword` prompt.
 - `--home` / `OPENCHAT_HOME`, по умолчанию `~/.openchat`.
 - `listen --once --idle N` — drain и выход; без `--once` — цикл.
+- CLI вынесен в библиотеку `oc_cli::run_cli_from(argv)`; бинарник `oc` —
+  тонкая обёртка, `oc-desktop --cli` вызывает ту же функцию.
+
+### `oc-desktop`
+- Бинарник `oc-desktop` (egui/eframe 0.32): экран разблокировки
+  (каталог + пароль), контакты, переписка, invite, outbox-индикатор.
+- Фоновая нить владеет `Client` + `RelayPool` (свой tokio-рантайм);
+  UI <-> воркер — `std::sync::mpsc` (`WorkerCommand`/`UiEvent`).
+- `--cli` в argv → CLI-режим через `oc_cli::run_cli_from`.
+- Логика состояния (`OpenChatApp::apply`, `can_send` и т.д.) покрыта
+  тестами без окна; визуально в песочнице GUI не проверялся (winit не
+  может подключиться к Wayland/X11 из песочницы).
 
 ---
 
@@ -241,8 +255,8 @@ curl http://127.0.0.1:8080/health
 21. Windows-сборка ещё не проверялась.
 22. macOS отложен.
 23. Публичный релей ещё не развёрнут.
-24. Нет TUI/desktop UI (интерактивный CLI `oc chat` готов; истории
-    сообщений открытым текстом нет по дизайну).
+24. Нет TUI (desktop `oc-desktop` готов, но GUI-рендер не проверен
+    в песочнице; истории сообщений открытым текстом нет по дизайну).
 25. Argon2id KDF на каждый `open` (~20–40 ms) — нормально для CLI,
     но для UI понадобится кэш ключа/OS keyring.
 
@@ -292,8 +306,12 @@ curl http://127.0.0.1:8080/health
    - Слушать + отправлять в одном процессе, `/help`, `/peer`, `/quit`.
    - E2E вручную: два клиента через локальный релей, сообщения и ACK
      в обе стороны.
-2. Desktop UI (Linux gnu/musl, Windows) и упаковка — позже, после деплоя
-   публичного релея.
+2. **Desktop UI** — готово
+   - `oc-desktop` (egui): разблокировка, контакты, переписка, invite.
+   - `oc-desktop --cli` — тот же CLI, без смены бинарника.
+   - Проверено: сборка + clippy + 7 unit-тестов + `--cli` E2E.
+     GUI-рендер в песочнице не запускается (winit/display).
+3. TUI (`ratatui`) и упаковка — позже, после деплоя публичного релея.
 
 ---
 

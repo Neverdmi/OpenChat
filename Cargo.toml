@@ -7,6 +7,17 @@ members = [
     "crates/oc-relay",
     "crates/oc-client",
     "crates/oc-cli",
+    # Desktop UI needs native X11/Wayland libraries and is not part of
+    # the musl/static builds; it is built on demand (`cargo build -p oc-desktop`).
+    "crates/oc-desktop",
+]
+default-members = [
+    "crates/oc-core",
+    "crates/oc-wire",
+    "crates/oc-transport",
+    "crates/oc-relay",
+    "crates/oc-client",
+    "crates/oc-cli",
 ]
 
 [workspace.package]

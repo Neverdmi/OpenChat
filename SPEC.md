@@ -337,7 +337,7 @@ GET  /health
 
 ### 11.1 Стек
 - Ядро: Rust, `#![forbid(unsafe_code)]`.
-- UI: сначала CLI (`oc`: одноразовые команды + интерактивный `chat`), потом TUI (`ratatui`) и desktop (`egui`/`iced`, один статический бинарник — дружит с musl).
+- UI: сначала CLI (`oc`: одноразовые команды + интерактивный `chat`), desktop (`oc-desktop`, egui), потом TUI (`ratatui`). Desktop — отдельный бинарник с нативными X11/Wayland; в musl/static-сборки он не входит.
 - Мобильные позже: `uniffi` → Kotlin/Swift.
 - Крипто: `ed25519-dalek`, `x25519-dalek`, `ml-kem`, `chacha20poly1305`, `hkdf`, `sha2`, `blake2`.
 - Транспорт: `tokio`, `tokio-tungstenite`, `rustls`, `reqwest`/`hyper`.
@@ -406,6 +406,20 @@ magic(8) || salt(16) || nonce(24) || XChaCha20-Poly1305(JSON state)
 - История открытым текстом не хранится (в состоянии её нет по дизайну):
   сообщения печатаются при получении или при replay с релея.
 
+### 11.6 Desktop (`oc-desktop`)
+
+- Отдельный крейт/бинарник `oc-desktop` на egui (eframe); в workspace
+  входит, но не в `default-members`, поэтому musl/static-сборки его не
+  трогают.
+- Запуск без аргументов — графический интерфейс: экран разблокировки
+  (каталог состояния + пароль), список контактов, окно переписки,
+  добавление по invite, индикатор outbox.
+- `oc-desktop --cli [команда…]` — тот же CLI, что и `oc`
+  (общий код в библиотеке `oc-cli`), без переключения бинарника.
+- Протокол и состояние общие с CLI (`oc-client`): фоновый воркер владеет
+  `Client` и пулом, UI общается с ним каналами. История — только
+  на время сессии, как и в CLI.
+
 ---
 
 ## 12. Дорожная карта
@@ -417,7 +431,7 @@ magic(8) || salt(16) || nonce(24) || XChaCha20-Poly1305(JSON state)
 | P2 | `oc-transport`: Carrier trait, WebSocket-релей, пул, health-check | готово (41 тест суммарно) |
 | P3 | `oc-client` + CLI: invite → handshake → текст 1:1, offline-доставка | готово (70 тестов суммарно) |
 | P4 | `oc-relay`, default pool, manifest, MQTT/WebRTC-фолбэки | частично: MQTT готов; публичный релей ждёт деплоя, WebRTC — позже |
-| P5 | CLI-интерфейс, затем Desktop UI (Linux gnu/musl + Windows), упаковка | частично: интерактивный CLI (`oc chat`) готов; desktop — позже |
+| P5 | CLI-интерфейс, затем Desktop UI (Linux gnu/musl + Windows), упаковка | частично: интерактивный CLI (`oc chat`) и desktop (`oc-desktop`, egui, `--cli` → CLI) готовы; TUI и упаковка — позже |
 | P6 | Tor-режимы, cover-трафик, аудит, mobile | — |
 
 ---
