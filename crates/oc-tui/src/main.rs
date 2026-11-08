@@ -101,31 +101,56 @@ fn handle_key(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) {
     }
 
     if app.locked {
-        // Tab switches between the home directory and passphrase fields.
+        // F2 toggles Unlock/Create, F3 generates a passphrase (create
+        // mode), Tab cycles fields, Enter submits.
         match code {
+            KeyCode::F(2) => {
+                app.lock_mode = match app.lock_mode {
+                    app::LockMode::Unlock => app::LockMode::Create,
+                    app::LockMode::Create => app::LockMode::Unlock,
+                };
+                app.error = None;
+            }
+            KeyCode::F(3) if app.lock_mode == app::LockMode::Create => {
+                app.generate_passphrase();
+            }
             KeyCode::Tab => {
-                app.lock_field = match app.lock_field {
-                    app::LockField::Home => app::LockField::Passphrase,
-                    app::LockField::Passphrase => app::LockField::Home,
+                app.lock_field = match (app.lock_mode, app.lock_field) {
+                    (app::LockMode::Unlock, app::LockField::Home) => app::LockField::Passphrase,
+                    (app::LockMode::Unlock, _) => app::LockField::Home,
+                    (app::LockMode::Create, app::LockField::Home) => app::LockField::Passphrase,
+                    (app::LockMode::Create, app::LockField::Passphrase) => app::LockField::Confirm,
+                    (app::LockMode::Create, _) => app::LockField::Home,
                 };
             }
-            KeyCode::Enter => app.unlock(),
-            KeyCode::Backspace => {
-                match app.lock_field {
-                    app::LockField::Home => {
-                        app.home.pop();
-                    }
-                    app::LockField::Passphrase => {
-                        app.passphrase.pop();
-                    }
+            KeyCode::Enter => match app.lock_mode {
+                app::LockMode::Unlock => app.unlock(),
+                app::LockMode::Create => app.create_state(),
+            },
+            KeyCode::Backspace => match app.lock_field {
+                app::LockField::Home => {
+                    app.home.pop();
                 }
-            }
+                app::LockField::Passphrase => {
+                    app.passphrase.pop();
+                }
+                app::LockField::Confirm => {
+                    app.confirm_passphrase.pop();
+                }
+            },
             KeyCode::Char(ch) => match app.lock_field {
                 app::LockField::Home => app.home.push(ch),
                 app::LockField::Passphrase => app.passphrase.push(ch),
+                app::LockField::Confirm => app.confirm_passphrase.push(ch),
             },
             _ => {}
         }
+        return;
+    }
+
+    // Esc closes the invite panel.
+    if app.show_invite && code == KeyCode::Esc {
+        app.show_invite = false;
         return;
     }
 
@@ -198,6 +223,23 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TuiApp) {
         .highlight_style(Style::default().add_modifier(Modifier::BOLD));
     frame.render_stateful_widget(contacts, body[0], &mut state);
 
+    // Invite panel replaces the conversation while it is open.
+    if app.show_invite {
+        let invite_text = vec![
+            Line::from("Your invite link — send it to a contact out-of-band:"),
+            Line::from(""),
+            Line::from(app.invite.clone()),
+            Line::from(""),
+            Line::from("Esc to close"),
+        ];
+        let panel = Paragraph::new(invite_text)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("Invite"));
+        frame.render_widget(panel, body[1]);
+        render_input_and_footer(frame, app, chunks);
+        return;
+    }
+
     // Conversation, auto-scrolled to the end.
     let title = match (app.selected_short(), app.contacts.get(app.selected)) {
         (Some(short), Some(contact)) => {
@@ -229,6 +271,14 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TuiApp) {
         .scroll((scroll, 0));
     frame.render_widget(messages, body[1]);
 
+    render_input_and_footer(frame, app, chunks);
+}
+
+fn render_input_and_footer(
+    frame: &mut ratatui::Frame,
+    app: &TuiApp,
+    chunks: std::rc::Rc<[ratatui::layout::Rect]>,
+) {
     // Input.
     let input_title = match app.focus {
         Focus::Input => "Message (Enter send · Tab contacts · /add <invite> · /help · Ctrl+C quit)",
@@ -256,18 +306,27 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TuiApp) {
 }
 
 fn draw_unlock(frame: &mut ratatui::Frame, app: &TuiApp) {
+    let creating = app.lock_mode == app::LockMode::Create;
+    let mut constraints = vec![
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
+    ];
+    if creating {
+        constraints.push(Constraint::Length(3));
+    }
+    constraints.push(Constraint::Length(1));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
+        .constraints(constraints)
         .split(frame.area());
 
-    let title = Paragraph::new("OpenChat — unlock your encrypted state")
-        .block(Block::default().borders(Borders::ALL));
+    let title_text = if creating {
+        "OpenChat — create a new identity (F2 back to unlock)"
+    } else {
+        "OpenChat — unlock your encrypted state (F2 to create new)"
+    };
+    let title = Paragraph::new(title_text).block(Block::default().borders(Borders::ALL));
     frame.render_widget(title, chunks[0]);
 
     let home_style = if app.lock_field == app::LockField::Home {
@@ -289,19 +348,48 @@ fn draw_unlock(frame: &mut ratatui::Frame, app: &TuiApp) {
         Style::default()
     };
     let masked = "*".repeat(app.passphrase.chars().count());
+    let pass_title = if creating {
+        "Passphrase (F3 generate, Tab next)"
+    } else {
+        "Passphrase (Enter to unlock)"
+    };
     let passphrase = Paragraph::new(masked).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(pass_style)
-            .title("Passphrase (Enter to unlock)"),
+            .title(pass_title),
     );
     frame.render_widget(passphrase, chunks[2]);
 
+    let footer_index = if creating {
+        let confirm_style = if app.lock_field == app::LockField::Confirm {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+        };
+        let masked_confirm = "*".repeat(app.confirm_passphrase.chars().count());
+        let confirm = Paragraph::new(masked_confirm).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(confirm_style)
+                .title("Repeat passphrase (Enter to create)"),
+        );
+        frame.render_widget(confirm, chunks[3]);
+        4
+    } else {
+        3
+    };
+
+    let default_footer = if creating {
+        "Invent a passphrase (min 8 chars) or press F3 to generate a strong one. Write it down — it cannot be recovered."
+    } else {
+        "First run? Press F2 to create a new identity."
+    };
     let footer = match &app.error {
         Some(error) => Span::styled(error.clone(), Style::default().fg(Color::Red)),
-        None => Span::raw("First run? Create state first: oc init (you invent the passphrase there)"),
+        None => Span::raw(default_footer),
     };
-    frame.render_widget(Paragraph::new(Line::from(footer)), chunks[3]);
+    frame.render_widget(Paragraph::new(Line::from(footer)), chunks[footer_index]);
 }
 
 #[cfg(test)]

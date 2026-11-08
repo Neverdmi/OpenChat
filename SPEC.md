@@ -10,7 +10,7 @@
 | Вопрос | Решение |
 |---|---|
 | Tor | Три режима: `off`, `fallback` (только когда все остальные носители недоступны), `always` (весь трафик через Tor, допускаются `.onion`-релеи). Реализация — `arti-client`. |
-| Платформы | Сначала desktop: Linux `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, Windows `x86_64-pc-windows-msvc`. macOS — позже. |
+| Платформы | Linux `x86_64-unknown-linux-gnu` (glibc), `x86_64-unknown-linux-musl` (статика, работает и на glibc), `aarch64-unknown-linux-gnu`; Windows `x86_64-pc-windows-msvc` — проверить позже. macOS — позже. |
 | Релеи | Встроенный курируемый пул по умолчанию + возможность добавлять/удалять свои. В репозитории есть `oc-relay` — self-hosted релей без логов, чтобы любой мог поднять свой. |
 | PQ | Гибрид `X25519 + ML-KEM-768` с v1. Формат ключей/инвайтов сразу PQ-совместимый, fallback на чистый X25519 только для совместимости со старыми клиентами. |
 | Файлы | Не поддерживаются. Только текст (и служебные кадры). |
@@ -341,7 +341,8 @@ GET  /health
 
 ### 11.1 Стек
 - Ядро: Rust, `#![forbid(unsafe_code)]`.
-- UI: сначала CLI (`oc`: одноразовые команды + интерактивный `chat`), TUI (`oc-tui`, ratatui) и desktop (`oc-desktop`, egui). TUI/desktop — отдельные бинарники; в musl/static-сборки по умолчанию они не входят.
+- UI: CLI (`oc`: одноразовые команды + интерактивный `chat`) и TUI (`oc-tui`, ratatui) — одна программа на пользователя: TUI содержит всё (создание identity, пароль, invite, чат), `--cli` внутри неё открывает CLI-режим. GUI-версия (egui) удалена по решению пользователя: TUI понравился больше.
+- Сборка под glibc и musl одной командой с `--target` (см. README §Сборка); musl-бинарник статический и работает и на glibc-системах.
 - Мобильные позже: `uniffi` → Kotlin/Swift.
 - Крипто: `ed25519-dalek`, `x25519-dalek`, `ml-kem`, `chacha20poly1305`, `hkdf`, `sha2`, `blake2`.
 - Транспорт: `tokio`, `tokio-tungstenite`, `rustls`, `reqwest`/`hyper`.
@@ -358,7 +359,8 @@ openchat/
     oc-transport/   # трейт Carrier + реализации
     oc-relay/       # self-hosted релей
     oc-client/      # состояние, сессии, очередь, хранилище
-    oc-cli/         # CLI/TUI
+    oc-cli/         # CLI (библиотека + бинарник oc)
+    oc-tui/         # TUI (бинарник oc-tui; --cli → CLI)
   relays/default.json
 ```
 
@@ -410,29 +412,25 @@ magic(8) || salt(16) || nonce(24) || XChaCha20-Poly1305(JSON state)
 - История открытым текстом не хранится (в состоянии её нет по дизайну):
   сообщения печатаются при получении или при replay с релея.
 
-### 11.6 Desktop (`oc-desktop`)
+### 11.6 TUI (`oc-tui`)
 
-- Отдельный крейт/бинарник `oc-desktop` на egui (eframe); в workspace
-  входит, но не в `default-members`, поэтому musl/static-сборки его не
-  трогают.
-- Запуск без аргументов — графический интерфейс: экран разблокировки
-  (каталог состояния + пароль), список контактов, окно переписки,
-  добавление по invite, индикатор outbox.
-- `oc-desktop --cli [команда…]` — тот же CLI, что и `oc`
-  (общий код в библиотеке `oc-cli`), без переключения бинарника.
+- Бинарник `oc-tui` на ratatui + crossterm; в workspace входит, но не
+  в `default-members` (собирается по требованию).
+- Экран входа в двух режимах (переключение **F2**):
+  - *Unlock*: каталог состояния + пароль, Enter — открыть.
+  - *Create*: каталог + пароль + повтор; **F3** генерирует сильный
+    пароль (`word-word-word-word-1234`, CSPRNG). Создаёт identity и
+    зашифрованное состояние прямо в TUI, релеи — из встроенного списка.
+- После входа: контакты слева (↑↓, Enter), переписка по центру
+  (автопрокрутка, safety number в заголовке), ввод снизу.
+  Команды в вводе: `/invite` (полная ссылка в отдельной панели, Esc —
+  закрыть), `/add <invite>` (или вставка `openchat://…`), `/contacts`,
+  `/flush`, `/help`, `/quit`; `Ctrl+C` — выход.
+- `oc-tui --cli …` — тот же CLI, что и `oc` (общий код в библиотеке
+  `oc-cli`), без переключения бинарника.
 - Протокол и состояние общие с CLI (`oc-client`): фоновый воркер владеет
   `Client` и пулом, UI общается с ним каналами. История — только
   на время сессии, как и в CLI.
-
-### 11.7 TUI (`oc-tui`)
-
-- Бинарник `oc-tui` на ratatui + crossterm; в workspace входит, но не
-  в `default-members` (собирается по требованию, как desktop).
-- Экран разблокировки (каталог + пароль, переключение полей по Tab),
-  затем: контакты слева (↑↓, Enter), переписка по центру (автопрокрутка,
-  safety number в заголовке), ввод снизу. Команды в вводе: `/add <invite>`
-  (или вставка `openchat://…`), `/contacts`, `/flush`, `/help`, `/quit`;
-  `Ctrl+C` — выход. `oc-tui --cli …` — тот же CLI, что и `oc`.
 
 ---
 
@@ -445,7 +443,7 @@ magic(8) || salt(16) || nonce(24) || XChaCha20-Poly1305(JSON state)
 | P2 | `oc-transport`: Carrier trait, WebSocket-релей, пул, health-check | готово (41 тест суммарно) |
 | P3 | `oc-client` + CLI: invite → handshake → текст 1:1, offline-доставка | готово (70 тестов суммарно) |
 | P4 | `oc-relay`, default pool, manifest, MQTT/WebRTC-фолбэки | частично: MQTT готов; публичный релей ждёт деплоя, WebRTC — позже |
-| P5 | CLI-интерфейс, затем Desktop UI (Linux gnu/musl + Windows), упаковка | частично: интерактивный CLI (`oc chat`), TUI (`oc-tui`, ratatui, `--cli` → CLI) и desktop (`oc-desktop`, egui, `--cli` → CLI) готовы; упаковка — позже |
+| P5 | CLI + TUI (`oc-tui`), GUI удалён по решению пользователя, упаковка | частично: интерактивный CLI (`oc chat`) и TUI (создание identity, генерация пароля, invite, чат; `--cli` → CLI) готовы; упаковка и Windows-проверка — позже |
 | P6 | Tor-режимы, cover-трафик, аудит, mobile | — |
 
 ---

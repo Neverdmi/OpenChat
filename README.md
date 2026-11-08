@@ -3,8 +3,8 @@
 Анонимный текстовый мессенджер на публичной инфраструктуре.
 
 - Спецификация: [SPEC.md](SPEC.md)
-- Статус: P5 — CLI и desktop готовы; P4 почти готов (ждёт деплоя публичного релея)
-- Тесты: 90 (+7 в oc-desktop)
+- Статус: P5 — CLI и TUI готовы (GUI удалён); P4 почти готов (ждёт деплоя публичного релея)
+- Тесты: 92 (+11 в oc-tui)
 
 ## Что уже работает
 
@@ -44,13 +44,32 @@
   команды `/help`, `/peer <prefix>`, `/quit`. История открытым текстом
   не хранится — сообщения печатаются при получении.
 
-## Сборка и тесты
+## Сборка
+
+Одна программа — `oc-tui` (TUI) с CLI-режимом внутри (`--cli`).
+Собирается одной командой с указанием таргета:
+
+```bash
+# glibc (Debian/Ubuntu/Fedora и т.д.; нужен gcc для ring):
+cargo build --release -p oc-tui --target x86_64-unknown-linux-gnu
+
+# musl, статический бинарник (Alpine и любые хосты; работает и на glibc):
+cargo build --release -p oc-tui --target x86_64-unknown-linux-musl
+
+# хостовый таргет по умолчанию:
+cargo build --release -p oc-tui
+```
+
+musl-бинарник статический (static-pie): один файл, который запускается
+и на musl-, и на glibc-системах — самый простой вариант для раздачи
+друзьям. Бинарники: `target/<target>/release/oc-tui`.
+
+Тесты и проверки:
 
 ```bash
 cargo test
 cargo clippy --all-targets
-cargo build --release
-cargo build --release --target x86_64-unknown-linux-musl
+cargo test -p oc-tui
 ```
 
 ## Быстрый старт (два терминала)
@@ -109,26 +128,25 @@ OPENCHAT_PASSPHRASE='alice-passphrase' ./target/debug/oc --home /tmp/alice chat 
 Внутри: текст — отправить, `/peer <prefix>` — сменить собеседника,
 `/help` — справка, `/quit` — выход.
 
-## Desktop
+## TUI (`oc-tui`) — одна программа со всем
 
 ```bash
-cargo run -p oc-desktop            # графический интерфейс (egui)
-cargo run -p oc-desktop -- --cli chat <peer>   # тот же CLI, без смены бинарника
+./target/release/oc-tui            # терминальный интерфейс (ratatui)
+./target/release/oc-tui --cli chat <peer>   # тот же CLI, без смены бинарника
 ```
 
-Desktop — отдельный бинарник с нативными X11/Wayland; в musl/static-сборки
-он не входит. Экран разблокировки (каталог + пароль), контакты,
-переписка, добавление по invite.
+Первый запуск: на экране входа нажми **F2** (режим Create), введи каталог
+состояния, пароль — или **F3**, чтобы сгенерировать сильный
+(`word-word-word-word-1234`; запиши его, восстановить нельзя), повтори
+пароль, Enter. Дальше всё внутри:
 
-## TUI
+- контакты слева (Tab, ↑↓), переписка по центру, ввод снизу;
+- `/invite` — полная ссылка-приглашение отдельной панелью (Esc — закрыть);
+- `/add <invite>` (или вставить `openchat://…`) — добавить контакт;
+- `/contacts`, `/flush`, `/help`, `/quit`; `Ctrl+C` — выход.
 
-```bash
-cargo run -p oc-tui            # терминальный интерфейс (ratatui)
-cargo run -p oc-tui -- --cli chat <peer>   # тот же CLI, без смены бинарника
-```
-
-Контакты слева (↑↓), переписка по центру, ввод снизу. В вводе:
-`/add <invite>`, `/contacts`, `/flush`, `/help`, `/quit`; `Ctrl+C` — выход.
+GUI-версия (egui) удалена: TUI оказался удобнее, в одной программе
+остаются только TUI и CLI.
 
 ## Запуск релея
 
@@ -153,7 +171,6 @@ crates/oc-transport  Carrier, WebSocket-клиент, пул релеев
 crates/oc-relay      self-hosted релей + бинарник
 crates/oc-client     состояние, invite, сессии, текст, TOFU
 crates/oc-cli        CLI `oc` (библиотека + бинарник)
-crates/oc-desktop    десктоп `oc-desktop` (egui; `--cli` → CLI)
 crates/oc-tui        терминал `oc-tui` (ratatui; `--cli` → CLI)
 relays/default.json  встроенный список релеев (пока пуст)
 ```

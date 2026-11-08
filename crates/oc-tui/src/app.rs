@@ -101,6 +101,17 @@ pub enum LockField {
     Home,
     /// Passphrase.
     Passphrase,
+    /// Repeated passphrase (create mode only).
+    Confirm,
+}
+
+/// Unlock screen mode: open an existing state or create a new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    /// Open existing encrypted state.
+    Unlock,
+    /// Create a new identity + state.
+    Create,
 }
 
 /// Which panel has keyboard focus.
@@ -125,6 +136,8 @@ pub enum InputAction {
     FocusContacts,
     /// Retry the whole outbox now.
     Flush,
+    /// Show the full invite link panel.
+    Invite,
     /// Add a contact from this invite link.
     AddInvite(String),
     /// Send this text to the selected peer.
@@ -148,6 +161,9 @@ pub fn parse_input(line: &str) -> InputAction {
     }
     if line == "/flush" {
         return InputAction::Flush;
+    }
+    if line == "/invite" {
+        return InputAction::Invite;
     }
     if line.starts_with("openchat://") {
         return InputAction::AddInvite(line.to_string());
@@ -189,6 +205,12 @@ pub struct TuiApp {
     pub focus: Focus,
     /// Active unlock-form field.
     pub lock_field: LockField,
+    /// Unlock screen mode (open existing / create new).
+    pub lock_mode: LockMode,
+    /// Confirmation of the passphrase (create mode only).
+    pub confirm_passphrase: String,
+    /// Whether the full invite link panel is shown.
+    pub show_invite: bool,
     /// Last status message.
     pub status: String,
     /// Set when the user asked to quit.
@@ -212,6 +234,9 @@ impl TuiApp {
             input: String::new(),
             focus: Focus::Input,
             lock_field: LockField::Passphrase,
+            lock_mode: LockMode::Unlock,
+            confirm_passphrase: String::new(),
+            show_invite: false,
             status: String::new(),
             should_quit: false,
         }
@@ -255,6 +280,10 @@ impl TuiApp {
                 if let Some(worker) = &self.worker {
                     let _ = worker.commands.send(WorkerCommand::Flush);
                 }
+                self.input.clear();
+            }
+            InputAction::Invite => {
+                self.show_invite = true;
                 self.input.clear();
             }
             InputAction::AddInvite(link) => {
@@ -363,6 +392,58 @@ impl TuiApp {
         }
     }
 
+    /// Validate a create-state request without touching the filesystem.
+    pub fn validate_create(&self) -> Result<(), String> {
+        if StateStore::exists(&PathBuf::from(self.home.trim())) {
+            return Err("state already exists here — use Unlock mode".to_string());
+        }
+        if self.passphrase.chars().count() < 8 {
+            return Err("passphrase must be at least 8 characters".to_string());
+        }
+        if self.passphrase != self.confirm_passphrase {
+            return Err("passphrases do not match".to_string());
+        }
+        Ok(())
+    }
+
+    /// Generate a strong memorable passphrase and fill both fields.
+    pub fn generate_passphrase(&mut self) {
+        let generated = generate_passphrase();
+        self.passphrase = generated.clone();
+        self.confirm_passphrase = generated;
+        self.status = "generated passphrase — write it down, it cannot be recovered"
+            .to_string();
+    }
+
+    /// Create a new identity + encrypted state and start the worker.
+    pub fn create_state(&mut self) {
+        if let Err(message) = self.validate_create() {
+            self.error = Some(message);
+            return;
+        }
+        let home = PathBuf::from(self.home.trim());
+        let result = (|| -> Result<Worker, String> {
+            let store = StateStore::create(&home, &self.passphrase)
+                .map_err(|error| format!("create state: {error:#}"))?;
+            let relays = oc_transport::relay_list::default_relays()
+                .map_err(|error| format!("relay list: {error:#}"))?;
+            let client = Client::create(store, relays)
+                .map_err(|error| format!("create client: {error:#}"))?;
+            Ok(spawn_worker(client))
+        })();
+        match result {
+            Ok(worker) => {
+                self.worker = Some(worker);
+                self.error = None;
+                self.locked = false;
+                self.status = "identity created — share your invite with /invite".to_string();
+            }
+            Err(message) => {
+                self.error = Some(message);
+            }
+        }
+    }
+
     /// Try to unlock the state and start the worker thread.
     pub fn unlock(&mut self) {
         let home = PathBuf::from(self.home.trim());
@@ -398,6 +479,29 @@ impl Default for TuiApp {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Word list for generated passphrases (short, unambiguous, no digits
+/// inside words so the result stays easy to type and read aloud).
+const PASSPHRASE_WORDS: &[&str] = &[
+    "amber", "birch", "candle", "delta", "eagle", "flint", "garden", "harbor", "island",
+    "jungle", "karma", "lemon", "maple", "north", "ocean", "pepper", "quartz", "river",
+    "solar", "tulip", "umber", "violet", "walnut", "xenon", "yellow", "zebra", "atlas",
+    "basin", "cedar", "dune", "ember", "frost",
+];
+
+/// Generate a strong memorable passphrase: five random words plus a
+/// four-digit suffix, e.g. `amber-flint-garden-4815`. Randomness comes
+/// from the OS CSPRNG via `oc_core::random_array`.
+pub fn generate_passphrase() -> String {
+    let mut parts: Vec<&str> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let bytes = oc_core::random_array::<2>();
+        let index = (u16::from_le_bytes(bytes) as usize) % PASSPHRASE_WORDS.len();
+        parts.push(PASSPHRASE_WORDS[index]);
+    }
+    let digits = u16::from_le_bytes(oc_core::random_array::<2>()) % 10_000;
+    format!("{}-{:04}", parts.join("-"), digits)
 }
 
 /// Format a safety number as hex chunks, like the CLI.
@@ -631,5 +735,52 @@ mod tests {
         app.input = "/quit".to_string();
         app.submit_input();
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn invite_command_parses_and_opens_panel() {
+        assert_eq!(parse_input("/invite"), InputAction::Invite);
+        let mut app = TuiApp::new();
+        app.input = "/invite".to_string();
+        app.submit_input();
+        assert!(app.show_invite);
+    }
+
+    #[test]
+    fn generated_passphrase_is_strong_and_varied() {
+        let first = generate_passphrase();
+        let second = generate_passphrase();
+        assert!(first.chars().count() >= 20, "got: {first}");
+        assert_ne!(first, second);
+        // Five hyphen-separated words plus a 4-digit suffix.
+        let parts: Vec<&str> = first.split('-').collect();
+        assert_eq!(parts.len(), 6);
+        assert_eq!(parts[5].len(), 4);
+        assert!(parts[5].chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn create_validation_rejects_bad_input() {
+        let mut app = TuiApp::new();
+        app.home = "/tmp/oc-tui-test-nonexistent-home".to_string();
+        app.passphrase = "short".to_string();
+        app.confirm_passphrase = "short".to_string();
+        assert!(app.validate_create().is_err());
+
+        app.passphrase = "long-enough-passphrase".to_string();
+        app.confirm_passphrase = "different-passphrase".to_string();
+        assert!(app.validate_create().is_err());
+
+        app.confirm_passphrase = "long-enough-passphrase".to_string();
+        assert!(app.validate_create().is_ok());
+    }
+
+    #[test]
+    fn generate_fills_both_fields() {
+        let mut app = TuiApp::new();
+        app.generate_passphrase();
+        assert!(!app.passphrase.is_empty());
+        assert_eq!(app.passphrase, app.confirm_passphrase);
+        assert!(app.validate_create().is_ok() || app.validate_create().is_err());
     }
 }
