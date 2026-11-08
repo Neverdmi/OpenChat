@@ -89,7 +89,11 @@ pub struct ListenOutcome {
 
 #[derive(Clone)]
 enum MailboxRef {
-    Handshake { secret: [u8; 32] },
+    Handshake {
+        prekey: usize,
+        created_at: u64,
+        secret: [u8; 32],
+    },
     Inbox {
         peer_id: [u8; 32],
         epoch: u32,
@@ -129,9 +133,12 @@ impl Client {
         Ok(Self { state, store })
     }
 
-    /// Open and validate existing state.
+    /// Open and validate existing state, rotating prekeys when due.
     pub fn open(store: StateStore) -> Result<Self> {
-        let state = store.load()?;
+        let mut state = store.load()?;
+        if state.rotate_prekeys_if_due(now_unix())? {
+            store.save(&state)?;
+        }
         Ok(Self { state, store })
     }
 
@@ -175,6 +182,17 @@ impl Client {
     pub fn add_relays(&mut self, relays: Vec<String>) -> Result<()> {
         self.state.add_relays(relays);
         self.save()
+    }
+
+    /// Generate fresh prekeys now, keeping recent ones for late handshakes.
+    pub fn rotate_prekeys(&mut self) -> Result<()> {
+        self.state.rotate_prekeys()?;
+        self.save()
+    }
+
+    /// Number of prekeys that still accept handshakes (current + retired).
+    pub fn prekey_count(&self) -> usize {
+        self.state.prekey_count()
     }
 
     /// Add a contact from an invite and publish the X3DH initiation.
@@ -527,18 +545,21 @@ impl Client {
 
     fn subscriptions(&self) -> Result<(Vec<[u8; 32]>, SubscriptionMap, u64)> {
         let me = self.state.peer_id()?;
-        let prekeys = self.state.prekeys()?;
-        let bundle = self.state.bundle()?;
         let mut map = HashMap::new();
 
-        let handshake = prekeys.signed_prekey_public();
-        map.insert(
-            handshake,
-            MailboxRef::Handshake {
-                secret: prekeys.signed_prekey.to_bytes(),
-            },
-        );
-        let handshake_floor = bundle.created_at;
+        // Every prekey keeps its own handshake mailbox until it is retired.
+        for index in 0..self.state.prekey_count() {
+            let prekey = self.state.prekey_at(index)?;
+            let created_at = self.state.prekey_created_at(index)?;
+            map.insert(
+                prekey.signed_prekey_public(),
+                MailboxRef::Handshake {
+                    prekey: index,
+                    created_at,
+                    secret: prekey.signed_prekey.to_bytes(),
+                },
+            );
+        }
 
         let epoch = mailbox::epoch_of(now_unix());
         for contact in &self.state.contacts {
@@ -566,7 +587,7 @@ impl Client {
         let mut resume = u64::MAX;
         for (mailbox, reference) in &map {
             let floor = match reference {
-                MailboxRef::Handshake { .. } => handshake_floor,
+                MailboxRef::Handshake { created_at, .. } => *created_at,
                 MailboxRef::Inbox { epoch, peer_id, .. } => {
                     let epoch_start = u64::from(*epoch) * mailbox::EPOCH_SECONDS;
                     let contact_start = self
@@ -577,7 +598,10 @@ impl Client {
                     epoch_start.max(contact_start)
                 }
             };
-            let cursor = self.state.cursor(mailbox).map_or(floor, |value| value.max(floor));
+            // `since` is exclusive, so start one second before the earliest
+            // possible event (prekey/contact creation or epoch boundary).
+            let base = floor.saturating_sub(1);
+            let cursor = self.state.cursor(mailbox).map_or(base, |value| value.max(base));
             resume = resume.min(cursor);
         }
         if resume == u64::MAX {
@@ -594,8 +618,8 @@ impl Client {
         event: &RelayEvent,
     ) -> Result<Processed> {
         match map.get(&event.mailbox).cloned() {
-            Some(MailboxRef::Handshake { secret }) => {
-                self.process_handshake(&secret, &event.payload)
+            Some(MailboxRef::Handshake { prekey, secret, .. }) => {
+                self.process_handshake(prekey, &secret, &event.payload)
             }
             Some(MailboxRef::Inbox {
                 peer_id, secret, ..
@@ -604,7 +628,12 @@ impl Client {
         }
     }
 
-    fn process_handshake(&mut self, secret: &[u8; 32], payload: &[u8]) -> Result<Processed> {
+    fn process_handshake(
+        &mut self,
+        prekey_index: usize,
+        secret: &[u8; 32],
+        payload: &[u8],
+    ) -> Result<Processed> {
         let plaintext = match seal::open(secret, payload) {
             Ok(plaintext) => plaintext,
             Err(_) => return Ok(Processed::Ignored),
@@ -637,7 +666,10 @@ impl Client {
             }
         }
 
-        let prekeys = self.state.prekeys()?;
+        let prekeys = match self.state.prekey_at(prekey_index) {
+            Ok(prekeys) => prekeys,
+            Err(_) => return Ok(Processed::Ignored),
+        };
         let session_key = match x3dh::respond(&me, &prekeys, &initiation) {
             Ok(session_key) => session_key,
             Err(_) => return Ok(Processed::Ignored),

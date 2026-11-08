@@ -171,6 +171,58 @@ async fn state_and_sessions_survive_restart() {
 }
 
 #[tokio::test]
+async fn old_invites_still_work_after_prekey_rotation() {
+    let url = start_relay().await;
+    let pool = RelayPool::from_urls([url.clone()]).unwrap();
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    let carol_dir = tempfile::tempdir().unwrap();
+    let mut alice = client(alice_dir.path(), "alice-passphrase", &url);
+    let mut bob = client(bob_dir.path(), "bob-passphrase", &url);
+    let mut carol = client(carol_dir.path(), "carol-passphrase", &url);
+
+    let alice_id = alice.peer_id().unwrap();
+    let bob_id = bob.peer_id().unwrap();
+    let carol_id = carol.peer_id().unwrap();
+
+    let old_invite = bob.invite().unwrap();
+    bob.rotate_prekeys().unwrap();
+    let new_invite = bob.invite().unwrap();
+    assert_ne!(old_invite, new_invite);
+    assert_eq!(bob.prekey_count(), 2);
+
+    // Alice only has the pre-rotation invite.
+    alice.add_invite(&old_invite, &pool, 1).await.unwrap();
+    let incoming = bob
+        .listen_once(&pool, Duration::from_millis(500), 0)
+        .await
+        .unwrap();
+    assert_eq!(incoming.added_contacts, vec![alice_id]);
+    assert!(bob.contact(&alice_id).is_some());
+
+    let sent = alice
+        .send_text(&bob_id, "old invite", &pool, 1)
+        .await
+        .unwrap();
+    let incoming = bob
+        .listen_once(&pool, Duration::from_millis(500), 0)
+        .await
+        .unwrap();
+    assert_eq!(incoming.messages.len(), 1);
+    assert_eq!(incoming.messages[0].msg_id, sent.msg_id);
+
+    // A fresh invite uses the new prekey and works in parallel.
+    carol.add_invite(&new_invite, &pool, 1).await.unwrap();
+    let incoming = bob
+        .listen_once(&pool, Duration::from_millis(500), 0)
+        .await
+        .unwrap();
+    assert_eq!(incoming.added_contacts, vec![carol_id]);
+    assert!(bob.contact(&carol_id).is_some());
+}
+
+#[tokio::test]
 async fn listen_survives_relay_outage_and_messages_are_redelivered() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

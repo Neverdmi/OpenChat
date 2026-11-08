@@ -25,6 +25,27 @@ pub const OUTBOX_CAPACITY: usize = 1024;
 pub const ACK_CAPACITY: usize = 4096;
 /// Maximum number of remembered mailbox replay cursors.
 pub const CURSOR_CAPACITY: usize = 8192;
+/// Rotate signed prekeys and the PQ prekey every seven days.
+pub const PREKEY_ROTATION_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// Number of retired prekeys kept for late handshakes.
+pub const RETIRED_PREKEY_CAPACITY: usize = 2;
+
+/// A prekey that was replaced by rotation but still accepts handshakes.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RetiredPrekey {
+    /// Private prekeys, as produced by [`PrekeyPair::to_bytes`].
+    pub bytes: Vec<u8>,
+    /// UNIX seconds when the bundle using this prekey was created.
+    pub created_at: u64,
+}
+
+impl core::fmt::Debug for RetiredPrekey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RetiredPrekey")
+            .field("created_at", &self.created_at)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Last event timestamp seen on one mailbox.
 ///
@@ -151,8 +172,11 @@ pub struct ClientState {
     pub version: u32,
     /// Private identity bytes, as produced by [`Identity::to_bytes`].
     pub identity: Vec<u8>,
-    /// Private prekeys, as produced by [`PrekeyPair::to_bytes`].
+    /// Current private prekeys, as produced by [`PrekeyPair::to_bytes`].
     pub prekeys: Vec<u8>,
+    /// Retired private prekeys, newest first.
+    #[serde(default)]
+    pub old_prekeys: Vec<RetiredPrekey>,
     /// Signed prekey bundle published in invites.
     pub bundle: Vec<u8>,
     /// Known relays, in preference order.
@@ -178,6 +202,7 @@ impl core::fmt::Debug for ClientState {
         f.debug_struct("ClientState")
             .field("version", &self.version)
             .field("relays", &self.relays.len())
+            .field("old_prekeys", &self.old_prekeys.len())
             .field("contacts", &self.contacts.len())
             .field("seen", &self.seen.len())
             .field("outbox", &self.outbox.len())
@@ -196,6 +221,7 @@ impl ClientState {
             version: STATE_VERSION,
             identity: identity.to_bytes().to_vec(),
             prekeys: prekeys.to_bytes().to_vec(),
+            old_prekeys: Vec::new(),
             bundle: bundle.to_bytes(),
             relays,
             contacts: Vec::new(),
@@ -224,6 +250,74 @@ impl ClientState {
             .try_into()
             .map_err(|_| Error::State("prekey length".into()))?;
         Ok(PrekeyPair::from_bytes(&bytes))
+    }
+
+    /// Number of usable prekeys: the current one plus retired ones.
+    pub fn prekey_count(&self) -> usize {
+        1 + self.old_prekeys.len()
+    }
+
+    /// Load a prekey by index (`0` is the current one, the rest are retired).
+    pub fn prekey_at(&self, index: usize) -> Result<PrekeyPair> {
+        let bytes = if index == 0 {
+            self.prekeys.as_slice()
+        } else {
+            self.old_prekeys
+                .get(index - 1)
+                .ok_or_else(|| Error::State("prekey index out of range".into()))?
+                .bytes
+                .as_slice()
+        };
+        let bytes: [u8; PREKEY_PAIR_LEN] = bytes
+            .try_into()
+            .map_err(|_| Error::State("prekey length".into()))?;
+        Ok(PrekeyPair::from_bytes(&bytes))
+    }
+
+    /// UNIX seconds when a prekey's bundle was created.
+    pub fn prekey_created_at(&self, index: usize) -> Result<u64> {
+        if index == 0 {
+            Ok(self.bundle()?.created_at)
+        } else {
+            self.old_prekeys
+                .get(index - 1)
+                .map(|prekey| prekey.created_at)
+                .ok_or_else(|| Error::State("prekey index out of range".into()))
+        }
+    }
+
+    /// Whether the current prekey is old enough to rotate.
+    pub fn prekeys_due(&self, now: u64) -> Result<bool> {
+        Ok(now >= self.bundle()?.created_at.saturating_add(PREKEY_ROTATION_SECONDS))
+    }
+
+    /// Rotate the signed/PQ prekeys if they are older than seven days.
+    pub fn rotate_prekeys_if_due(&mut self, now: u64) -> Result<bool> {
+        if !self.prekeys_due(now)? {
+            return Ok(false);
+        }
+        self.rotate_prekeys()?;
+        Ok(true)
+    }
+
+    /// Generate fresh prekeys, retiring the current pair.
+    ///
+    /// Retired pairs keep decrypting handshakes addressed to their old
+    /// `SPK` mailbox, so invites shared before rotation still work.
+    pub fn rotate_prekeys(&mut self) -> Result<()> {
+        let identity = self.identity()?;
+        let created_at = self.bundle()?.created_at;
+        let (prekeys, bundle) = PrekeyPair::generate(&identity);
+
+        let retired = RetiredPrekey {
+            bytes: std::mem::take(&mut self.prekeys),
+            created_at,
+        };
+        self.old_prekeys.insert(0, retired);
+        self.old_prekeys.truncate(RETIRED_PREKEY_CAPACITY);
+        self.prekeys = prekeys.to_bytes().to_vec();
+        self.bundle = bundle.to_bytes();
+        Ok(())
     }
 
     /// Parse and verify the published bundle.
@@ -401,6 +495,14 @@ impl ClientState {
         if self.prekeys.len() != PREKEY_PAIR_LEN {
             return Err(Error::State("prekey length".into()));
         }
+        if self.old_prekeys.len() > RETIRED_PREKEY_CAPACITY {
+            return Err(Error::State("too many retired prekeys".into()));
+        }
+        for prekey in &self.old_prekeys {
+            if prekey.bytes.len() != PREKEY_PAIR_LEN {
+                return Err(Error::State("retired prekey length".into()));
+            }
+        }
         self.bundle()?;
         for contact in &self.contacts {
             if !contact.is_consistent() {
@@ -537,6 +639,39 @@ mod tests {
         state.mark_acked(&peer, &[9u8; 16]);
         assert!(state.acked(&peer, &[9u8; 16]));
         assert_eq!(state.acks.len(), 1);
+    }
+
+    #[test]
+    fn prekey_rotation_retires_but_keeps_old_keys_usable() {
+        let mut state = ClientState::generate(Vec::new()).unwrap();
+        let first = state.bundle().unwrap();
+        let identity = state.identity().unwrap();
+
+        state.rotate_prekeys().unwrap();
+        let second = state.bundle().unwrap();
+        assert_ne!(first.digest(), second.digest());
+        assert_eq!(state.prekey_count(), 2);
+        assert_eq!(
+            state.prekey_at(0).unwrap().signed_prekey_public(),
+            second.signed_prekey
+        );
+        assert_eq!(
+            state.prekey_at(1).unwrap().signed_prekey_public(),
+            first.signed_prekey
+        );
+
+        // A handshake addressed to the retired prekey still agrees.
+        let alice = Identity::generate();
+        let (initiation, alice_key) = oc_core::x3dh::initiate(&alice, &first).unwrap();
+        let bob_key =
+            oc_core::x3dh::respond(&identity, &state.prekey_at(1).unwrap(), &initiation).unwrap();
+        assert_eq!(alice_key, bob_key);
+
+        for _ in 0..4 {
+            state.rotate_prekeys().unwrap();
+        }
+        assert_eq!(state.old_prekeys.len(), RETIRED_PREKEY_CAPACITY);
+        state.validate().unwrap();
     }
 
     #[test]

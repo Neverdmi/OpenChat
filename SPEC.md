@@ -135,8 +135,10 @@ mailbox           = SPK_B
   равно запечатан: релей и DPI не видят структуру рукопожатия.
 - Ответчик подписывается на `SPK_B` и добавляет контакт после успешного
   `respond`.
-- Адрес живёт до ротации prekey (7 дней). Одноразовые handshake-ящики
-  появятся вместе с one-time prekeys.
+- Адрес живёт до ротации prekey (7 дней). При ротации клиент сохраняет
+  до двух предыдущих пар `SPK`/`PQK` и продолжает слушать их handshake-
+  ящики, поэтому выданные ранее invite-ссылки работают ещё 7–14 дней.
+  Одноразовые handshake-ящики появятся вместе с one-time prekeys.
 - Повторный Initiation с тем же transcript игнорируется; новый transcript
   заменяет сессию (пересоздание рукопожатия).
 
@@ -341,8 +343,11 @@ magic(8) || salt(16) || nonce(24) || XChaCha20-Poly1305(JSON state)
 ```
 - Ключ: `Argon2id(passphrase, salt, m=19456, t=2, p=1)`.
 - Пароль: `OPENCHAT_PASSPHRASE` или интерактивный ввод (`rpassword`).
-- В состоянии: identity, prekeys, подписанный bundle, контакты, ratchet
-  snapshots, mailbox roots, safety numbers, последние 4096 `msg_id`.
+- В состоянии: identity, текущие и до двух retired prekeys, подписанный
+  bundle, контакты, ratchet snapshots, mailbox roots, safety numbers,
+  outbox, последние 4096 `msg_id`/ACK и per-mailbox курсоры.
+- Ротация prekey автоматическая при открытии состояния (раз в 7 дней) или
+  вручную (`oc rotate`); существующие ratchet-сессии не затрагиваются.
 - Запись атомарная: `state.enc.tmp` → `rename`.
 - OS keyring — следующий шаг; текущий режим использует пароль и
   зашифрованный файл.

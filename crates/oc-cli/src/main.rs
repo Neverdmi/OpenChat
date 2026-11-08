@@ -89,6 +89,9 @@ enum Command {
 
     /// Show messages that have not reached any relay yet.
     Outbox,
+
+    /// Rotate signed/PQ prekeys now; old invites keep working.
+    Rotate,
 }
 
 #[tokio::main]
@@ -210,6 +213,14 @@ async fn run() -> Result<()> {
                     short_peer_id(&record.peer_id)
                 );
             }
+            Ok(())
+        }
+        Command::Rotate => {
+            let passphrase = passphrase(false)?;
+            let mut client = open_client(&args.home, &passphrase)?;
+            client.rotate_prekeys()?;
+            println!("prekeys rotated; {} prekey(s) accept handshakes", client.prekey_count());
+            println!("new invite: {}", client.invite()?);
             Ok(())
         }
         Command::Contacts => {

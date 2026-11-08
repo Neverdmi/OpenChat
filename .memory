@@ -2,8 +2,8 @@
 
 Обновлено: 2026-11-08
 Ветка: `main`
-Статус: P4 в работе (outbox, ACK, reconnect, курсоры готовы)
-Тестов: 76
+Статус: P4 в работе (outbox, ACK, reconnect, курсоры, ротация prekey готовы)
+Тестов: 78
 
 > Этот файл — точка входа для ИИ-агентов. Прочитай его и `SPEC.md`
 > перед любыми изменениями. После каждого завершённого этапа обновляй
@@ -33,7 +33,7 @@
 | P1: `oc-core` — крипто и протокол | готово, 33 теста |
 | P2: `oc-wire`, `oc-transport`, `oc-relay` | готово, 18 тестов |
 | P3: `oc-client` + CLI (invite → handshake → текст) | готово, 19 тестов |
-| P4: reconnect, outbox, prekey rotation, default pool, MQTT | **в работе**: outbox/ACK/reconnect/курсоры готовы |
+| P4: reconnect, outbox, prekey rotation, default pool, MQTT | **в работе**: outbox/ACK/reconnect/курсоры/ротация prekey готовы |
 | P5: desktop UI (Linux gnu/musl, Windows) | не начато |
 | P6: Tor, cover traffic, аудит, mobile | не начато |
 
@@ -110,7 +110,10 @@ openchat/
   flush_outbox}`. `send_text`/`add_invite` кладут событие в outbox **до**
   публикации; `listen_once` ретраит должное, расшифровывает и шлёт ACK.
 - `state.rs` — `OutboxRecord` (sealed payload + backoff), последние 4096
-  ACK (`peer_id || msg_id`) и per-mailbox курсоры `CursorRecord`.
+  ACK (`peer_id || msg_id`), per-mailbox курсоры `CursorRecord`,
+  `RetiredPrekey` (до 2 старых SPK/PQ).
+- Prekeys ротируются раз в 7 дней при `open` или через `oc rotate`; старые
+  handshake-ящики остаются в подписке, существующие сессии не меняются.
 - `listen_once` подписывается от минимума курсоров (с учётом создания
   prekey/контакта и начала эпохи), а не от `0`.
 - Handshake публикуется на `SPK` (sealed), ответчик слушает `SPK` + все
@@ -123,7 +126,7 @@ openchat/
 
 ### `oc-cli`
 - Бинарник `oc`, команды: `init`, `invite`, `add`, `send`, `listen`,
-  `contacts`, `flush`, `outbox`.
+  `contacts`, `flush`, `outbox`, `rotate`.
 - Пароль: `OPENCHAT_PASSPHRASE` или `rpassword` prompt.
 - `--home` / `OPENCHAT_HOME`, по умолчанию `~/.openchat`.
 - `listen --once --idle N` — drain и выход; без `--once` — цикл.
@@ -171,7 +174,7 @@ cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Ожидаемо: 76 тестов. Ручная проверка релея:
+Ожидаемо: 78 тестов. Ручная проверка релея:
 
 ```bash
 cargo run -p oc-relay -- --listen 127.0.0.1:8080
@@ -200,8 +203,8 @@ curl http://127.0.0.1:8080/health
 6. **Автоприём handshake** — любой, у кого есть invite, создаёт контакт
    (сначала `verified = false`); нет подтверждения/блокировки спама.
 7. **Handshake-mailbox = SPK** — стабилен до ротации prekey (7 дней),
-   нет one-time prekeys.
-8. **Нет ротации SPK/PQ prekey** на клиенте.
+   нет one-time prekeys. Ротация и retired prekeys готовы.
+8. ~~Нет ротации SPK/PQ prekey~~ — готово: авто раз в 7 дней + `oc rotate`.
 9. **Нет QR** — только текстовая invite-ссылка (~2.3 KB).
 10. **Нет команд управления релеями** — список задаётся при `init` и
     дополняется relay hints из invite.
@@ -250,9 +253,11 @@ curl http://127.0.0.1:8080/health
    - Per-mailbox `since`/last-created_at, чтобы не перечитывать всё.
    - E2E: listen во время падения релея возвращается без ошибки; после
      рестарта релея сообщение доставляется.
-3. **Prekey rotation**
+3. **Prekey rotation** — готово (кроме OPK)
    - Ротация SPK/PQ раз в 7 дней, old prekeys ещё принимают handshake.
-   - One-time prekeys (X3DH OPK) и handshake-mailbox на их основе.
+   - E2E: старый invite после ротации создаёт контакт; новый invite
+     работает параллельно.
+   - One-time prekeys (X3DH OPK) и handshake-mailbox на их основе — позже.
 4. **Пул релеев**
    - Развернуть публичный релей, заполнить `relays/default.json`.
    - Подписанный манифест, health-check, исключение мёртвых.
