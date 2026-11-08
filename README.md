@@ -120,6 +120,16 @@ Desktop — отдельный бинарник с нативными X11/Waylan
 он не входит. Экран разблокировки (каталог + пароль), контакты,
 переписка, добавление по invite.
 
+## TUI
+
+```bash
+cargo run -p oc-tui            # терминальный интерфейс (ratatui)
+cargo run -p oc-tui -- --cli chat <peer>   # тот же CLI, без смены бинарника
+```
+
+Контакты слева (↑↓), переписка по центру, ввод снизу. В вводе:
+`/add <invite>`, `/contacts`, `/flush`, `/help`, `/quit`; `Ctrl+C` — выход.
+
 ## Запуск релея
 
 ```bash
@@ -144,6 +154,7 @@ crates/oc-relay      self-hosted релей + бинарник
 crates/oc-client     состояние, invite, сессии, текст, TOFU
 crates/oc-cli        CLI `oc` (библиотека + бинарник)
 crates/oc-desktop    десктоп `oc-desktop` (egui; `--cli` → CLI)
+crates/oc-tui        терминал `oc-tui` (ratatui; `--cli` → CLI)
 relays/default.json  встроенный список релеев (пока пуст)
 ```
 

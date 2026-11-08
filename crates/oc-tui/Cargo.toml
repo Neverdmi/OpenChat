@@ -1,0 +1,21 @@
+[package]
+name = "oc-tui"
+description = "OpenChat terminal UI (ratatui); use --cli for the plain command-line interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "oc-tui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.29"
+hex = "0.4"
+oc-cli = { path = "../oc-cli" }
+oc-client = { path = "../oc-client" }
+oc-transport = { path = "../oc-transport" }
+ratatui = "0.29"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
