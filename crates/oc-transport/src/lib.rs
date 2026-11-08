@@ -39,4 +39,21 @@ pub trait Carrier: Send + Sync {
 
     /// Subscribe to a mailbox, replaying events newer than `since`.
     async fn subscribe(&self, mailbox: &[u8; 32], since: u64) -> Result<EventStream>;
+
+    /// Subscribe to several mailboxes over one logical stream.
+    ///
+    /// The default implementation merges individual subscriptions, which is
+    /// correct but opens one connection per mailbox. Carriers should override
+    /// it when the protocol supports multiplexed subscriptions.
+    async fn subscribe_many(&self, mailboxes: &[[u8; 32]], since: u64) -> Result<EventStream> {
+        if mailboxes.is_empty() {
+            return Err(Error::Relay("no mailboxes requested".into()));
+        }
+
+        let mut streams = Vec::with_capacity(mailboxes.len());
+        for mailbox in mailboxes {
+            streams.push(self.subscribe(mailbox, since).await?);
+        }
+        Ok(Box::pin(futures_util::stream::select_all(streams)))
+    }
 }

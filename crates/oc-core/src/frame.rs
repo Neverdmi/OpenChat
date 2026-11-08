@@ -37,7 +37,8 @@ pub fn unpad(frame: &[u8]) -> Result<&[u8]> {
         return Err(Error::Frame);
     }
 
-    let len = u16::from_le_bytes(frame[..2].try_into().expect("frame has at least 2 bytes")) as usize;
+    let len =
+        u16::from_le_bytes(frame[..2].try_into().expect("frame has at least 2 bytes")) as usize;
     if len + 2 > frame.len() {
         return Err(Error::Frame);
     }

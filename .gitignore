@@ -2,6 +2,8 @@
 **/*.rs.bk
 *.log
 .env
+state.enc
+state.enc.tmp
 
 # .memory is intentionally tracked: AI agent notes must never be ignored.
 !.memory

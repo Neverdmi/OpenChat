@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
@@ -104,6 +105,59 @@ fn kdf_root(root_key: &[u8; 32], dh_output: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     (root, chain)
 }
 
+/// One skipped message key, exported for encrypted state persistence.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SkippedKey {
+    /// Ratchet public key of the remote chain.
+    pub dh: [u8; 32],
+    /// Message number within that chain.
+    pub n: u32,
+    /// Derived message key.
+    pub key: [u8; 32],
+}
+
+/// Serializable snapshot of a [`Ratchet`].
+///
+/// Contains secret key material. Only write it to encrypted storage.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RatchetSnapshot {
+    /// Root key.
+    pub root_key: [u8; 32],
+    /// Local ratchet secret.
+    pub self_dh: [u8; 32],
+    /// Local ratchet public key.
+    pub self_dh_public: [u8; 32],
+    /// Remote ratchet public key, once known.
+    pub remote_dh: Option<[u8; 32]>,
+    /// Sending chain key, once a sending chain exists.
+    pub send_chain: Option<[u8; 32]>,
+    /// Receiving chain key, once a receiving chain exists.
+    pub recv_chain: Option<[u8; 32]>,
+    /// Messages sent in the current chain.
+    pub send_count: u32,
+    /// Messages sent in the previous chain.
+    pub prev_send_count: u32,
+    /// Messages received in the current chain.
+    pub recv_count: u32,
+    /// Keys retained for out-of-order delivery.
+    pub skipped: Vec<SkippedKey>,
+    /// Handshake transcript bound into AEAD associated data.
+    pub transcript: Vec<u8>,
+    /// Maximum number of skipped keys.
+    pub max_skip: u32,
+}
+
+impl core::fmt::Debug for RatchetSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RatchetSnapshot")
+            .field("send_count", &self.send_count)
+            .field("recv_count", &self.recv_count)
+            .field("skipped", &self.skipped.len())
+            .field("remote_dh", &self.remote_dh.map(|_| "<set>"))
+            .finish_non_exhaustive()
+    }
+}
+
 /// Per-session Double Ratchet state.
 pub struct Ratchet {
     root_key: [u8; 32],
@@ -193,6 +247,72 @@ impl Ratchet {
         }
     }
 
+    /// Export the complete ratchet state for encrypted persistence.
+    pub fn snapshot(&self) -> RatchetSnapshot {
+        RatchetSnapshot {
+            root_key: self.root_key,
+            self_dh: self.self_dh.to_bytes(),
+            self_dh_public: self.self_dh_public,
+            remote_dh: self.remote_dh,
+            send_chain: self.send_chain.as_ref().map(|chain| chain.key),
+            recv_chain: self.recv_chain.as_ref().map(|chain| chain.key),
+            send_count: self.send_count,
+            prev_send_count: self.prev_send_count,
+            recv_count: self.recv_count,
+            skipped: self
+                .skipped
+                .iter()
+                .map(|((dh, n), key)| SkippedKey {
+                    dh: *dh,
+                    n: *n,
+                    key: *key,
+                })
+                .collect(),
+            transcript: self.transcript.clone(),
+            max_skip: self.max_skip,
+        }
+    }
+
+    /// Restore a ratchet from [`Ratchet::snapshot`].
+    pub fn from_snapshot(snapshot: RatchetSnapshot) -> Result<Self> {
+        if snapshot.max_skip == 0 || snapshot.max_skip > MAX_SKIP {
+            return Err(Error::RatchetState);
+        }
+        if snapshot.skipped.len() > snapshot.max_skip as usize {
+            return Err(Error::TooManySkipped);
+        }
+        if snapshot.remote_dh.is_none()
+            && (snapshot.send_chain.is_some() || snapshot.recv_chain.is_some())
+        {
+            return Err(Error::RatchetState);
+        }
+
+        let self_dh = StaticSecret::from(snapshot.self_dh);
+        if PublicKey::from(&self_dh).to_bytes() != snapshot.self_dh_public {
+            return Err(Error::InvalidKey);
+        }
+
+        let mut skipped = BTreeMap::new();
+        for entry in snapshot.skipped {
+            skipped.insert((entry.dh, entry.n), entry.key);
+        }
+
+        Ok(Self {
+            root_key: snapshot.root_key,
+            self_dh,
+            self_dh_public: snapshot.self_dh_public,
+            remote_dh: snapshot.remote_dh,
+            send_chain: snapshot.send_chain.map(|key| ChainKey { key }),
+            recv_chain: snapshot.recv_chain.map(|key| ChainKey { key }),
+            send_count: snapshot.send_count,
+            prev_send_count: snapshot.prev_send_count,
+            recv_count: snapshot.recv_count,
+            skipped,
+            transcript: snapshot.transcript,
+            max_skip: snapshot.max_skip,
+        })
+    }
+
     /// Encrypt one message, returning its header and wire bytes.
     ///
     /// Wire format: `nonce(24) || ciphertext`.
@@ -205,10 +325,7 @@ impl Ratchet {
 
         let chain = self.send_chain.as_mut().ok_or(Error::RatchetState)?;
         let message_key = chain.next();
-        self.send_count = self
-            .send_count
-            .checked_add(1)
-            .ok_or(Error::RatchetState)?;
+        self.send_count = self.send_count.checked_add(1).ok_or(Error::RatchetState)?;
 
         let aad = self.associated_data(&header);
         let nonce = random_array::<{ aead::NONCE_LEN }>();
@@ -226,9 +343,8 @@ impl Ratchet {
             return Err(Error::InvalidLength);
         }
 
-        let nonce: [u8; aead::NONCE_LEN] = wire[..aead::NONCE_LEN]
-            .try_into()
-            .expect("length checked");
+        let nonce: [u8; aead::NONCE_LEN] =
+            wire[..aead::NONCE_LEN].try_into().expect("length checked");
         let ciphertext = &wire[aead::NONCE_LEN..];
         let aad = self.associated_data(header);
 
@@ -245,10 +361,7 @@ impl Ratchet {
 
         let chain = self.recv_chain.as_mut().ok_or(Error::RatchetState)?;
         let message_key = chain.next();
-        self.recv_count = self
-            .recv_count
-            .checked_add(1)
-            .ok_or(Error::RatchetState)?;
+        self.recv_count = self.recv_count.checked_add(1).ok_or(Error::RatchetState)?;
 
         aead::decrypt(&message_key, &nonce, &aad, ciphertext)
     }
@@ -344,11 +457,8 @@ mod tests {
         assert_eq!(alice_session, bob_session);
 
         let transcript = x3dh::transcript(&initiation, &bob.public());
-        let alice_ratchet = Ratchet::new_initiator(
-            &alice_session,
-            &bundle.signed_prekey,
-            transcript.clone(),
-        );
+        let alice_ratchet =
+            Ratchet::new_initiator(&alice_session, &bundle.signed_prekey, transcript.clone());
 
         let PrekeyPair { signed_prekey, .. } = bob_prekeys;
         let bob_ratchet = Ratchet::new_responder(&bob_session, signed_prekey, transcript);
@@ -405,5 +515,34 @@ mod tests {
         };
         assert_eq!(Header::from_bytes(&header.to_bytes()).unwrap(), header);
         assert!(Header::from_bytes(&[0u8; 7]).is_err());
+    }
+
+    #[test]
+    fn snapshot_roundtrip_keeps_conversation_working() {
+        let (mut alice, mut bob) = pair();
+
+        let (h, ct) = alice.encrypt(b"before restart").unwrap();
+        assert_eq!(bob.decrypt(&h, &ct).unwrap(), b"before restart");
+
+        // Persist and restore both sides mid-conversation.
+        let mut alice = Ratchet::from_snapshot(alice.snapshot()).unwrap();
+        let mut bob = Ratchet::from_snapshot(bob.snapshot()).unwrap();
+
+        let (h, ct) = alice.encrypt(b"after restart").unwrap();
+        assert_eq!(bob.decrypt(&h, &ct).unwrap(), b"after restart");
+
+        let (h, ct) = bob.encrypt(b"reply").unwrap();
+        assert_eq!(alice.decrypt(&h, &ct).unwrap(), b"reply");
+    }
+
+    #[test]
+    fn snapshot_rejects_corrupted_ratchet_key() {
+        let (alice, _) = pair();
+        let mut snapshot = alice.snapshot();
+        snapshot.self_dh_public[0] ^= 1;
+        assert!(matches!(
+            Ratchet::from_snapshot(snapshot),
+            Err(Error::InvalidKey)
+        ));
     }
 }

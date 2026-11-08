@@ -7,7 +7,7 @@
 //! one-shot mailbox public keys, enforces size/TTL limits and streams them to
 //! subscribers. It has no accounts, no access log and no way to read content.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +26,7 @@ use tokio::sync::{RwLock, broadcast};
 
 const MAX_CLOCK_SKEW_SECONDS: u64 = 300;
 const BROADCAST_CAPACITY: usize = 1024;
+const MAX_MAILBOXES_PER_CONNECTION: usize = 4096;
 
 /// Relay limits.
 #[derive(Debug, Clone)]
@@ -155,10 +156,7 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-async fn publish_http(
-    State(state): State<AppState>,
-    Json(event): Json<RelayEvent>,
-) -> Response {
+async fn publish_http(State(state): State<AppState>, Json(event): Json<RelayEvent>) -> Response {
     match state.accept(event).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
@@ -168,6 +166,7 @@ async fn publish_http(
 #[derive(Debug, Deserialize)]
 struct SubscribeParams {
     mailbox: Option<String>,
+    mailboxes: Option<String>,
     since: Option<u64>,
 }
 
@@ -182,8 +181,8 @@ async fn ws_handler(
 async fn client_loop(socket: WebSocket, state: AppState, params: SubscribeParams) {
     let (mut sender, mut receiver) = socket.split();
 
-    let mailbox = match params.mailbox.as_deref().map(parse_mailbox).transpose() {
-        Ok(mailbox) => mailbox,
+    let initial = match parse_mailboxes(&params) {
+        Ok(mailboxes) => mailboxes,
         Err(message) => {
             let _ = send_json(&mut sender, &ServerMessage::Error { message }).await;
             let _ = sender.close().await;
@@ -194,23 +193,10 @@ async fn client_loop(socket: WebSocket, state: AppState, params: SubscribeParams
     // Subscribe before the snapshot so no live event can slip between the two.
     let mut live = state.tx.subscribe();
     let since = params.since.unwrap_or(0);
+    let mut subscribed: HashSet<[u8; 32]> = initial.iter().copied().collect();
 
-    if let Some(mailbox) = mailbox {
-        let stored = state
-            .events
-            .read()
-            .await
-            .get(&mailbox)
-            .cloned()
-            .unwrap_or_default();
-
-        for event in stored {
-            if event.created_at > since
-                && !send_json(&mut sender, &ServerMessage::Event { event }).await
-            {
-                return;
-            }
-        }
+    if !initial.is_empty() && !replay_events(&state, &initial, since, &mut sender).await {
+        return;
     }
 
     loop {
@@ -233,6 +219,41 @@ async fn client_loop(socket: WebSocket, state: AppState, params: SubscribeParams
                                     break;
                                 }
                             }
+                            Ok(ClientMessage::Subscribe { mailboxes, since }) => {
+                                let mut added = Vec::new();
+                                let mut overflow = false;
+                                for mailbox in mailboxes {
+                                    if subscribed.contains(&mailbox) {
+                                        continue;
+                                    }
+                                    if subscribed.len() >= MAX_MAILBOXES_PER_CONNECTION {
+                                        overflow = true;
+                                        break;
+                                    }
+                                    subscribed.insert(mailbox);
+                                    added.push(mailbox);
+                                }
+
+                                if overflow {
+                                    let reply = ServerMessage::Error {
+                                        message: format!(
+                                            "too many mailboxes (max {MAX_MAILBOXES_PER_CONNECTION})"
+                                        ),
+                                    };
+                                    if !send_json(&mut sender, &reply).await {
+                                        break;
+                                    }
+                                } else {
+                                    if !added.is_empty()
+                                        && !replay_events(&state, &added, since, &mut sender).await
+                                    {
+                                        break;
+                                    }
+                                    if !send_json(&mut sender, &ServerMessage::Subscribed).await {
+                                        break;
+                                    }
+                                }
+                            }
                             Err(error) => {
                                 let reply = ServerMessage::Error {
                                     message: format!("invalid message: {error}"),
@@ -251,12 +272,10 @@ async fn client_loop(socket: WebSocket, state: AppState, params: SubscribeParams
             received = live.recv() => {
                 match received {
                     Ok(event) => {
-                        if let Some(mailbox) = mailbox {
-                            if event.mailbox == mailbox
-                                && !send_json(&mut sender, &ServerMessage::Event { event }).await
-                            {
-                                break;
-                            }
+                        if subscribed.contains(&event.mailbox)
+                            && !send_json(&mut sender, &ServerMessage::Event { event }).await
+                        {
+                            break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -265,6 +284,62 @@ async fn client_loop(socket: WebSocket, state: AppState, params: SubscribeParams
             }
         }
     }
+}
+
+/// Replay stored events for the given mailboxes, oldest first.
+async fn replay_events(
+    state: &AppState,
+    mailboxes: &[[u8; 32]],
+    since: u64,
+    sender: &mut SplitSink<WebSocket, Message>,
+) -> bool {
+    let mut events = {
+        let store = state.events.read().await;
+        let mut out = Vec::new();
+        for mailbox in mailboxes {
+            if let Some(bucket) = store.get(mailbox) {
+                out.extend(
+                    bucket
+                        .iter()
+                        .filter(|event| event.created_at > since)
+                        .cloned(),
+                );
+            }
+        }
+        out
+    };
+
+    events.sort_by_key(|event| (event.created_at, event.mailbox));
+    for event in events {
+        if !send_json(sender, &ServerMessage::Event { event }).await {
+            return false;
+        }
+    }
+    true
+}
+
+fn parse_mailboxes(params: &SubscribeParams) -> Result<Vec<[u8; 32]>, String> {
+    let mut out = Vec::new();
+    if let Some(mailbox) = params.mailbox.as_deref() {
+        out.push(parse_mailbox(mailbox)?);
+    }
+    if let Some(list) = params.mailboxes.as_deref() {
+        for part in list.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            out.push(parse_mailbox(part)?);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    if out.len() > MAX_MAILBOXES_PER_CONNECTION {
+        return Err(format!(
+            "too many mailboxes (max {MAX_MAILBOXES_PER_CONNECTION})"
+        ));
+    }
+    Ok(out)
 }
 
 async fn send_json(sender: &mut SplitSink<WebSocket, Message>, message: &ServerMessage) -> bool {

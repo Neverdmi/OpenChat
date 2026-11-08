@@ -127,22 +127,52 @@ impl Carrier for RelayClient {
             .await
             .map_err(|_| Error::Timeout)??;
 
-        let stream = socket.filter_map(|message| async move {
-            match message {
-                Ok(Message::Text(text)) => match serde_json::from_str::<ServerMessage>(&text) {
-                    Ok(ServerMessage::Event { event }) => Some(Ok(event)),
-                    Ok(ServerMessage::Error { message }) => Some(Err(Error::Relay(message))),
-                    Ok(_) => None,
-                    Err(error) => Some(Err(Error::Json(error))),
-                },
-                Ok(Message::Close(_)) => None,
-                Ok(_) => None,
-                Err(error) => Some(Err(Error::Ws(error))),
-            }
-        });
-
-        Ok(Box::pin(stream))
+        Ok(event_stream(socket))
     }
+
+    async fn subscribe_many(&self, mailboxes: &[[u8; 32]], since: u64) -> Result<EventStream> {
+        if mailboxes.is_empty() {
+            return Err(Error::Relay("no mailboxes requested".into()));
+        }
+
+        // Multiplexed subscription: one WebSocket, one `subscribe` message.
+        // Keeps request URLs short even with thousands of rotating mailboxes.
+        let url = self.ws_url(None, 0)?;
+        let (mut socket, _) = tokio::time::timeout(OP_TIMEOUT, connect_async(url.as_str()))
+            .await
+            .map_err(|_| Error::Timeout)??;
+
+        let message = ClientMessage::Subscribe {
+            mailboxes: mailboxes.to_vec(),
+            since,
+        };
+        let text = serde_json::to_string(&message)?;
+        socket.send(Message::Text(text.into())).await?;
+
+        Ok(event_stream(socket))
+    }
+}
+
+fn event_stream<S>(socket: S) -> EventStream
+where
+    S: futures_util::Stream<
+            Item = core::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
+        > + Send
+        + 'static,
+{
+    Box::pin(socket.filter_map(|message| async move {
+        match message {
+            Ok(Message::Text(text)) => match serde_json::from_str::<ServerMessage>(&text) {
+                Ok(ServerMessage::Event { event }) => Some(Ok(event)),
+                Ok(ServerMessage::Error { message }) => Some(Err(Error::Relay(message))),
+                Ok(_) => None,
+                Err(error) => Some(Err(Error::Json(error))),
+            },
+            Ok(Message::Close(_)) => None,
+            Ok(_) => None,
+            Err(error) => Some(Err(Error::Ws(error))),
+        }
+    }))
 }
 
 #[cfg(test)]

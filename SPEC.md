@@ -66,12 +66,24 @@ version(1) | IK_sign(32) | IK_dh(32) | SPK(32) | created_at(8)
 
 ### Invite
 ```
-openchat://v1/<peer_id_b32>/<bundle_b64>/<relay_hints>
+openchat://v1/<peer_id_b32>/<bundle_b64>[/<relay_hints_b64>]
 ```
+- `peer_id_b32` — PeerID без padding, base32 (uppercase).
+- `bundle_b64` — bundle из раздела выше, base64url без padding.
+- `relay_hints_b64` — необязательный сегмент: base64url от списка URL,
+  разделённых `\n`; максимум 16 подсказок.
+- Если сегмент отсутствует или пуст, используются только локальные релеи.
 - Передаётся вне канала (QR, текст, любой мессенджер).
-- `relay_hints` — список рекомендуемых релеев, необязателен.
 - TOFU + «safety number»:
   `SN = BLAKE2b("openchat/safety/v1" || sorted(IK_sign_A, IK_sign_B) || IK_dh_A || IK_dh_B)`.
+- Клиент пинит `IK_sign`/`IK_dh` собеседника при первом добавлении;
+  смена identity-ключей у подтверждённого контакта — ошибка, а не тихая
+  замена.
+- Инициатор подтверждён подписью bundle. Ответчик помечает контакт
+  `verified = false`, пока не расшифрует первое ratchet-сообщение: это
+  доказывает владение identity-ключом и защищает от подмены/блокировки
+  контакта поддельным initiation. Неподтверждённый контакт может быть
+  заменён новым рукопожатием; подтверждённый — только ошибкой TOFU.
 
 ---
 
@@ -106,6 +118,28 @@ mailbox_root = HKDF(SK, "openchat/mailbox-root/v1", 32)
 ratchet_root = HKDF(SK, "openchat/ratchet-root/v1", 32)
 ```
 
+### 4.1 Доставка Initiation
+У ответчика ещё нет сессии, поэтому первый кадр нельзя адресовать на
+одноразовый ящик. Initiation публикуется на **handshake-mailbox** —
+публичный ключ `SPK_B` из bundle:
+
+```
+initiation_padded = frame::pad(Initiation::to_bytes())
+inner             = version(1) || kind=1 || initiation_padded
+wire              = seal(SPK_B, inner)
+mailbox           = SPK_B
+```
+
+- `SPK_B` — X25519 signed prekey; его секрет есть только у ответчика.
+- Initiation содержит только публичные значения, но внешний конверт всё
+  равно запечатан: релей и DPI не видят структуру рукопожатия.
+- Ответчик подписывается на `SPK_B` и добавляет контакт после успешного
+  `respond`.
+- Адрес живёт до ротации prekey (7 дней). Одноразовые handshake-ящики
+  появятся вместе с one-time prekeys.
+- Повторный Initiation с тем же transcript игнорируется; новый transcript
+  заменяет сессию (пересоздание рукопожатия).
+
 ---
 
 ## 5. Double Ratchet
@@ -134,8 +168,13 @@ slot_secret(epoch, i) =
 mailbox_pk(epoch, i) = X25519_base(slot_secret)
 ```
 - По умолчанию 32 слота на эпоху (`SLOTS_PER_EPOCH = 32`).
-- Получатель подписывается на все 32 адреса текущей и следующей эпохи.
-- Отправитель берёт случайный неиспользованный слот.
+- Получатель подписывается на 32 адреса текущей и следующей эпохи, плюс
+  на свой handshake-mailbox (`SPK`).
+- Отправитель берёт случайный неиспользованный слот (`slot_mask` в
+  состоянии); после 32 сообщений маска сбрасывается.
+- Подписка мультиплексируется в одном WebSocket через
+  `{"type":"subscribe","mailboxes":[...],"since":...}`, поэтому 64+ адресов
+  не требуют 64 соединений.
 - Через сутки адреса полностью меняются → межсуточная связь невозможна.
 - Внутри суток сообщения лежат на разных ключах; связать их можно только по таймингу/размеру, что маскируется паддингом и задержками.
 
@@ -177,6 +216,16 @@ frame = len_le(2) || payload || random_padding
 
 Текст ограничен 4096 байтами UTF-8 (body). Больше — несколько кадров с `msg_id`-цепочкой.
 
+### 8.1 Внутренний конверт клиента
+Перед запечатыванием в mailbox:
+```
+version(1) || kind(1) || payload
+kind=1  handshake: payload = frame::pad(Initiation)
+kind=2  text:      payload = header(40) || ratchet_ciphertext
+```
+`ratchet_ciphertext = nonce(24) || AEAD(frame_padded)`. Длина `kind=2`
+фиксирована бакетами, `kind=1` — бакетом 4096 из-за ML-KEM ciphertext.
+
 ---
 
 ## 9. Транспорт
@@ -214,16 +263,22 @@ frame = len_le(2) || payload || random_padding
 ### 10.1 Протокол релея
 Минимальный публичный API (WebSocket, JSON):
 ```
-WS   /ws?mailbox=<hex>&since=<ts>
+WS   /ws?mailbox=<hex>&since=<ts>          // один ящик, совместимость
+WS   /ws?mailboxes=<hex>,<hex>,...&since=<ts>
      client -> {"type":"publish","event":{...}}   // можно и без mailbox
+     client -> {"type":"subscribe","mailboxes":["<hex>",...],"since":<ts>}
      client -> {"type":"ping"}
      relay  -> {"type":"event","event":{...}}
-     relay  -> {"type":"published"} | {"type":"pong"} | {"type":"error","message":"..."}
+     relay  -> {"type":"published"} | {"type":"subscribed"} | {"type":"pong"}
+             | {"type":"error","message":"..."}
 
 POST /publish   { mailbox, created_at, expires_at, payload_b64 }   // совместимость
 GET  /health
 ```
-- Основной путь клиента — один WebSocket: подписка на ящик, публикация и ping.
+- Основной путь клиента — один WebSocket: мультиплексированная подписка,
+  публикация и ping.
+- `subscribe` добавляет ящики к открытому соединению и проигрывает
+  сохранённые события новее `since`; лимит — 4096 ящиков на соединение.
 - `POST /publish` оставлен для простых интеграций и отладки.
 - Релей не требует аккаунта и не хранит IP в логах (по умолчанию access-log отсутствует).
 - Хранит только `mailbox`, `created_at`, `expires_at`, `payload` (шифротекст).
@@ -274,6 +329,21 @@ cargo build --release --target x86_64-unknown-linux-musl
 cargo test
 ```
 
+### 11.4 Состояние клиента (P3)
+Файл `state.enc` (права `0600`):
+```
+magic(8) || salt(16) || nonce(24) || XChaCha20-Poly1305(JSON state)
+```
+- Ключ: `Argon2id(passphrase, salt, m=19456, t=2, p=1)`.
+- Пароль: `OPENCHAT_PASSPHRASE` или интерактивный ввод (`rpassword`).
+- В состоянии: identity, prekeys, подписанный bundle, контакты, ratchet
+  snapshots, mailbox roots, safety numbers, последние 4096 `msg_id`.
+- Запись атомарная: `state.enc.tmp` → `rename`.
+- OS keyring — следующий шаг; текущий режим использует пароль и
+  зашифрованный файл.
+- Исходящей очереди/ретраев пока нет: ошибка публикации возвращается
+  пользователю, повтор — повторный `send`.
+
 ---
 
 ## 12. Дорожная карта
@@ -283,7 +353,7 @@ cargo test
 | P0 | Спека, модель угроз, wire format | готово |
 | P1 | `oc-core`: identity, PQ, X3DH, sealed sender, кадры, ящики, ratchet + тесты | готово (25 тестов) |
 | P2 | `oc-transport`: Carrier trait, WebSocket-релей, пул, health-check | готово (41 тест суммарно) |
-| P3 | `oc-client` + CLI: invite → handshake → текст 1:1, offline-доставка | — |
+| P3 | `oc-client` + CLI: invite → handshake → текст 1:1, offline-доставка | готово (70 тестов суммарно) |
 | P4 | `oc-relay`, default pool, manifest, MQTT/WebRTC-фолбэки | — |
 | P5 | Desktop UI (Linux gnu/musl + Windows), упаковка | — |
 | P6 | Tor-режимы, cover-трафик, аудит, mobile | — |

@@ -86,18 +86,56 @@ impl RelayPool {
 
     /// Subscribe through the first relay that accepts the connection.
     pub async fn subscribe(&self, mailbox: &[u8; 32], since: u64) -> Result<EventStream> {
+        self.subscribe_many(core::slice::from_ref(mailbox), since)
+            .await
+    }
+
+    /// Subscribe to several mailboxes through the first relay that accepts.
+    pub async fn subscribe_many(&self, mailboxes: &[[u8; 32]], since: u64) -> Result<EventStream> {
         if self.relays.is_empty() {
             return Err(Error::NoRelay);
+        }
+        if mailboxes.is_empty() {
+            return Err(Error::Relay("no mailboxes requested".into()));
         }
 
         let mut last_error = None;
         for index in pick_indices(self.relays.len(), self.relays.len()) {
-            match self.relays[index].subscribe(mailbox, since).await {
+            match self.relays[index].subscribe_many(mailboxes, since).await {
                 Ok(stream) => return Ok(stream),
                 Err(error) => last_error = Some(error),
             }
         }
         Err(last_error.unwrap_or(Error::NoRelay))
+    }
+
+    /// Subscribe to several mailboxes through **every** relay and merge the
+    /// streams. Duplicates are expected and must be dropped above this layer.
+    pub async fn subscribe_all_many(
+        &self,
+        mailboxes: &[[u8; 32]],
+        since: u64,
+    ) -> Result<EventStream> {
+        if self.relays.is_empty() {
+            return Err(Error::NoRelay);
+        }
+        if mailboxes.is_empty() {
+            return Err(Error::Relay("no mailboxes requested".into()));
+        }
+
+        let mut streams = Vec::with_capacity(self.relays.len());
+        let mut last_error = None;
+        for relay in &self.relays {
+            match relay.subscribe_many(mailboxes, since).await {
+                Ok(stream) => streams.push(stream),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        if streams.is_empty() {
+            return Err(last_error.unwrap_or(Error::NoRelay));
+        }
+        Ok(Box::pin(futures_util::stream::select_all(streams)))
     }
 
     /// Health-check every relay.

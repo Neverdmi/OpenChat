@@ -1,9 +1,9 @@
 # OpenChat — память проекта
 
-Обновлено: 2026-11-07
+Обновлено: 2026-11-08
 Ветка: `main`
-Статус: P2 завершён, следующий этап — P3
-Тестов: 41
+Статус: P3 завершён, следующий этап — P4
+Тестов: 70
 
 > Этот файл — точка входа для ИИ-агентов. Прочитай его и `SPEC.md`
 > перед любыми изменениями. После каждого завершённого этапа обновляй
@@ -30,16 +30,17 @@
 | Этап | Статус |
 |---|---|
 | P0: спецификация и модель угроз | готово |
-| P1: `oc-core` — крипто и протокол | готово, 25 тестов |
-| P2: `oc-wire`, `oc-transport`, `oc-relay` | готово, 16 тестов |
-| P3: `oc-client` + CLI (первое реальное сообщение) | **следующий** |
-| P4: MQTT/WebRTC-фолбэки, default pool | не начато |
+| P1: `oc-core` — крипто и протокол | готово, 33 теста |
+| P2: `oc-wire`, `oc-transport`, `oc-relay` | готово, 18 тестов |
+| P3: `oc-client` + CLI (invite → handshake → текст) | готово, 19 тестов |
+| P4: reconnect, outbox, prekey rotation, default pool, MQTT | **следующий** |
 | P5: desktop UI (Linux gnu/musl, Windows) | не начато |
 | P6: Tor, cover traffic, аудит, mobile | не начато |
 
-Текущее состояние: криптографическое ядро и транспорт готовы и покрыты
-тестами, но **соединить их в работающий чат ещё нельзя** — нет клиента,
-хранилища состояния и invite-логики. Это задача P3.
+Текущее состояние: два клиента через локальный релей обмениваются текстом
+в обе стороны, offline-доставка работает (релей хранит события), состояние
+и ratchet-сессии переживают перезапуск. Проверено вручную через CLI и
+интеграционными тестами.
 
 ---
 
@@ -49,6 +50,7 @@
 openchat/
   SPEC.md                  полная спецификация v1
   .memory                  этот файл (в git, НЕ игнорировать)
+  AGENTS.md                инструкции для агентов
   Cargo.toml               workspace
   crates/
     oc-core/               крипто: identity, X3DH, ratchet, sealed sender,
@@ -56,14 +58,18 @@ openchat/
     oc-wire/               общие JSON-типы протокола релея
     oc-transport/          Carrier, WebSocket-клиент, пул релеев
     oc-relay/              self-hosted релей + бинарь oc-relay
+    oc-client/             состояние, invite, сессии, TOFU, текст
+    oc-cli/                CLI `oc`
   relays/default.json      встроенный список релеев (пока пуст)
 ```
 
 ### `oc-core`
-- `identity.rs` — Ed25519 + X25519, `PeerID`, safety number.
-- `pq.rs` — ML-KEM-768.
-- `x3dh.rs` — гибридный X3DH, подписанный `PrekeyBundle`, transcript.
-- `ratchet.rs` — Double Ratchet, out-of-order, `MAX_SKIP = 1000`.
+- `identity.rs` — Ed25519 + X25519, `PeerID`, safety number,
+  `to_bytes`/`from_bytes` для приватной identity.
+- `pq.rs` — ML-KEM-768, сериализация decapsulation seed.
+- `x3dh.rs` — гибридный X3DH, `PrekeyBundle`/`Initiation` wire format,
+  `PrekeyPair` serialization, transcript.
+- `ratchet.rs` — Double Ratchet, `RatchetSnapshot` (serde) + `from_snapshot`.
 - `seal.rs` — sealed sender (релей не видит отправителя).
 - `mailbox.rs` — 32 одноразовых адреса на сутки.
 - `frame.rs` — паддинг в 256/1024/4096/16384.
@@ -72,22 +78,47 @@ openchat/
 ### `oc-wire`
 - `RelayEvent { mailbox, created_at, expires_at, payload }`.
 - JSON: mailbox — hex, payload — base64url.
-- `ClientMessage`: `publish`, `ping`.
-- `ServerMessage`: `event`, `published`, `pong`, `error`.
-- `HealthResponse`.
+- `ClientMessage`: `publish`, `subscribe`, `ping`.
+- `ServerMessage`: `event`, `published`, `subscribed`, `pong`, `error`.
+- `subscribe` несёт список ящиков (hex) и `since`.
 
 ### `oc-transport`
-- `Carrier` trait: `health`, `publish`, `subscribe`.
+- `Carrier` trait: `health`, `publish`, `subscribe`, `subscribe_many`.
 - `RelayClient` — WebSocket, TLS через rustls + ring.
-- `RelayPool` — случайный fan-out, fallback при подписке, health-check.
+- `RelayPool` — fan-out, fallback, `subscribe_all_many` (merge всех релеев).
 - `relay_list` — парсинг `relays/default.json`.
 
 ### `oc-relay`
 - Store-and-forward по одноразовым ящикам.
 - Лимиты: TTL 7 дней, 100 событий/ящик, 64 KiB payload.
 - `POST /publish`, `GET /health`, `WS /ws`.
+- `subscribe` добавляет до 4096 ящиков на соединение и проигрывает stored.
 - Без аккаунтов, без access-log, IP не логируются.
 - Статический musl-бинарник ~1.7 MB.
+
+### `oc-client`
+- `state.rs` — `ClientState`, `ContactRecord`, TOFU-ключи, dedup,
+  флаг `verified`.
+- `store.rs` — `state.enc`: magic || Argon2id salt || nonce || ciphertext.
+  Argon2id `m=19456,t=2,p=1`; запись `0600`, атомарная через rename.
+- `invite.rs` — `openchat://v1/<peer_b32>/<bundle_b64>[/<relays_b64>]`.
+- `message.rs` — text body (`msg_id`, timestamp, UTF-8) и inner envelope
+  (`kind=1` handshake, `kind=2` ratchet text).
+- `client.rs` — `Client::{create,open,invite,add_invite,send_text,listen_once}`.
+- Handshake публикуется на `SPK` (sealed), ответчик слушает `SPK` + все
+  слоты текущей и следующей эпохи для каждого контакта.
+- Все подписки идут одним WebSocket через `subscribe`.
+- Dedup: последние 4096 `msg_id` в состоянии.
+- Инициатор сразу `verified` (подписанный bundle); ответчик — только после
+  первого успешного ratchet-расшифрования. Неподтверждённый контакт можно
+  заменить новым handshake, подтверждённый защищён TOFU.
+
+### `oc-cli`
+- Бинарник `oc`, команды: `init`, `invite`, `add`, `send`, `listen`,
+  `contacts`.
+- Пароль: `OPENCHAT_PASSPHRASE` или `rpassword` prompt.
+- `--home` / `OPENCHAT_HOME`, по умолчанию `~/.openchat`.
+- `listen --once --idle N` — drain и выход; без `--once` — цикл.
 
 ---
 
@@ -102,7 +133,9 @@ openchat/
 - **Релеи**: встроенный курируемый список + пользовательские.
   В репозитории есть self-hosted релей.
 - **Только текст** в v1. Группы — позже через MLS (RFC 9420).
-- UI: сначала CLI/TUI (`ratatui`), потом desktop (`egui`/`iced`).
+- **UI**: сначала CLI (`oc`), потом TUI (`ratatui`) и desktop (`egui`/`iced`).
+- **Состояние**: пароль + Argon2id + XChaCha20; OS keyring — следующий шаг.
+- **Invite relay hints**: base64url от URL, разделённых `\n`, максимум 16.
 
 ---
 
@@ -114,6 +147,8 @@ openchat/
 - Наружу не уходят размеры и тайминги: только фиксированные бакеты.
 - Релей не должен логировать IP, токены и содержимое.
 - Сообщения не подписываются (денайябилити); аутентичность — ratchet AEAD.
+- TOFU: смена `IK_sign`/`IK_dh` подтверждённого контакта — ошибка, не
+  тихая замена; неподтверждённый контакт может быть заменён handshake'ем.
 - После изменений: `cargo test`, `cargo clippy --all-targets`, сборка musl.
 - При изменении протокола обновлять `SPEC.md` и тест-векторы.
 
@@ -128,72 +163,92 @@ cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Ожидаемо: 41 тест. Ручная проверка релея:
+Ожидаемо: 70 тестов. Ручная проверка релея:
 
 ```bash
 cargo run -p oc-relay -- --listen 127.0.0.1:8080
 curl http://127.0.0.1:8080/health
 ```
 
+Ручная проверка чата — раздел «Быстрый старт» в `README.md`.
+Ключевое: `OPENCHAT_PASSPHRASE` должен быть одинаковым для всех команд
+одного клиента.
+
 ---
 
 ## 7. Известные проблемы и долги
 
-### Блокируют P3
-1. **Нет клиента и CLI** — протокол пока нельзя использовать для переписки.
-2. **Нет сериализации состояния** — `Ratchet`, сессии и ключи живут только
-   в памяти; после перезапуска всё теряется. Нужен зашифрованный store.
-3. **Нет invite-кодирования** — bundle → `openchat://...`, QR и парсинг.
-4. **Нет TOFU-хранилища** — негде пиннить ключи собеседников.
-5. **Нет app-дедупликации** — одно сообщение, опубликованное в 3 релея,
-   придёт несколько раз; нужен dedup по `msg_id`.
+### Клиент и доставка
+1. **Нет outbox и ретраев** — при ошибке публикации `send` возвращает
+   ошибку; повтор только вручную.
+2. **Нет ACK** — отправитель не знает, что получатель расшифровал.
+3. **Нет per-mailbox курсора** — `listen` перечитывает с `since=0`;
+   дубликаты гасятся ratchet-ключами и `seen`, но это лишний трафик.
+4. **Ошибка одного relay-стрима обрывает `listen_once`** — нет reconnect
+   и backoff.
+5. **`subscribe_all_many`** подключается ко всем релеям, но при падении
+   любого из них стрим завершается ошибкой.
+6. **Автоприём handshake** — любой, у кого есть invite, создаёт контакт
+   (сначала `verified = false`); нет подтверждения/блокировки спама.
+7. **Handshake-mailbox = SPK** — стабилен до ротации prekey (7 дней),
+   нет one-time prekeys.
+8. **Нет ротации SPK/PQ prekey** на клиенте.
+9. **Нет QR** — только текстовая invite-ссылка (~2.3 KB).
+10. **Нет команд управления релеями** — список задаётся при `init` и
+    дополняется relay hints из invite.
+11. **Нет шифрования метаданных очереди** — хранится только необходимое,
+    но размеры состояния видны по файлу.
 
 ### Транспорт и релей
-6. `relays/default.json` пуст — без добавления релея клиент не заработает.
-7. Подписка только к одному релею; нет merge потоков и reconnect.
-8. На релее нет rate limiting / anti-DoS; только лимиты на ящик и payload.
-9. Нет event id: `since` работает по `created_at`, возможны дубли.
-10. Replay на уровне приложения не реализован (ratchet ловит внутри сессии).
+12. `relays/default.json` пуст — без `--relay` клиент не заработает.
+13. На релее нет rate limiting / anti-DoS; только лимиты на ящик и payload.
+14. Нет event id: `since` работает по `created_at`, возможны дубли.
+15. Нет cover traffic и рандомизации задержек на уровне клиента.
+16. Подписка на 64+ ящиков на контакт масштабируется линейно; лимит 4096
+    на соединение.
 
 ### Крипто и протокол
-11. X3DH без one-time prekeys — только signed prekey. Приемлемо, но слабее.
-12. Нет ротации SPK/PQ prekey (заявлено раз в 7 дней) на клиенте.
-13. Крипто не аудировано; `ml-kem` по документации crate тоже без аудита.
-14. Нет cover traffic и рандомизации задержек на уровне клиента.
-15. Групповых чатов и MLS нет.
+17. X3DH без one-time prekeys — только signed prekey.
+18. Крипто не аудировано; `ml-kem` по документации crate тоже без аудита.
+19. Групповых чатов и MLS нет.
 
 ### Инфраструктура
-16. Нет CI, упаковки, подписи обновлений.
-17. Windows-сборка ещё не проверялась.
-18. macOS отложен.
-19. Публичный релей ещё не развёрнут.
-20. Нет UI (только будущий CLI/TUI).
+20. Нет CI, упаковки, подписи обновлений.
+21. Windows-сборка ещё не проверялась.
+22. macOS отложен.
+23. Публичный релей ещё не развёрнут.
+24. Нет TUI/desktop UI.
+25. Argon2id KDF на каждый `open` (~20–40 ms) — нормально для CLI,
+    но для UI понадобится кэш ключа/OS keyring.
 
 ---
 
-## 8. Следующий этап — P3
+## 8. Следующий этап — P4
 
-Цель: два терминала обмениваются invite и реально пересылают текст.
+Цель: сделать доставку устойчивой и пригодной для реальной сети.
 
 Порядок работ:
-1. `oc-client` crate:
-   - `IdentityStore` — генерация/загрузка identity, OS keyring или
-     зашифрованный файл.
-   - `Invite` — encode/decode `openchat://v1/...` (bundle + relay hints).
-   - `SessionManager` — X3DH handshake, Ratchet, mailbox chains, TOFU.
-   - `MessageStore` — исходящие/входящие, dedup по `msg_id`, ретраи.
-   - Сериализация состояния (postcard/serde) + шифрование XChaCha20.
-2. `oc-cli`:
-   - `init` — создать identity.
-   - `invite` — показать invite-ссылку.
-   - `add <invite>` — добавить контакт и инициировать handshake.
-   - `send <peer> <text>` — зашифровать, упаковать в frame, sealed sender,
-     опубликовать в пул.
-   - `listen` — подписка на свои ящики, расшифровка, вывод.
-3. Интеграционный тест: релей + два клиента + обмен сообщением.
+1. **Outbox + ACK + ретраи**
+   - `OutboxRecord { msg_id, peer_id, frame, created_at, attempts }`.
+   - ACK-кадр (`type=ACK`) после успешной расшифровки.
+   - Повторная публикация с exponential backoff, TTL.
+2. **Reconnect и курсоры**
+   - `subscribe_all_many` не падает из-за одного релея: ошибки потока
+     превращать в reconnect.
+   - Per-mailbox `since`/last-created_at, чтобы не перечитывать всё.
+3. **Prekey rotation**
+   - Ротация SPK/PQ раз в 7 дней, old prekeys ещё принимают handshake.
+   - One-time prekeys (X3DH OPK) и handshake-mailbox на их основе.
+4. **Пул релеев**
+   - Развернуть публичный релей, заполнить `relays/default.json`.
+   - Подписанный манифест, health-check, исключение мёртвых.
+5. **MQTT-носитель** (WSS) как второй `Carrier`.
+6. **Тесты**: offline → online, несколько релеев, потеря соединения,
+   повторная доставка, ротация prekey.
 
-Критерий готовности: `cargo run -p oc-cli -- send` доставляет текст
-второму клиенту через локальный релей, состояние переживает перезапуск.
+Критерий готовности: сообщение, отправленное при недоступном релее,
+доставляется после восстановления сети; ACK виден отправителю; prekey
+ротируется без потери старых сессий.
 
 ---
 
@@ -203,7 +258,8 @@ curl http://127.0.0.1:8080/health
 - Токен лежит в `~/.git-credentials` (права 600), scope `public_repo`.
 - **Агент обязан коммитить и пушить сам** после каждого завершённого шага,
   не спрашивая подтверждения.
-- Не коммитить: `target/`, `.env`, `*.log`, токены, `~/.git-credentials`.
+- Не коммитить: `target/`, `.env`, `*.log`, токены, `~/.git-credentials`,
+  `state.enc`.
 - Сообщения коммитов — Conventional Commits:
   `feat(scope): ...`, `fix(scope): ...`, `docs: ...`, `chore: ...`.
 - `.memory` обязателен в git и **не должен** попадать в `.gitignore`.
@@ -219,6 +275,7 @@ curl http://127.0.0.1:8080/health
 2. Не меняй криптографические схемы без обновления `SPEC.md` и тестов.
 3. Не логируй IP, токены, ключи и содержимое сообщений.
 4. Держи `cargo test` и `cargo clippy` зелёными.
-5. После этапа обнови разделы 2, 7, 8 этого файла.
+5. После этапа обнови разделы 2, 3, 6, 7, 8 этого файла.
 6. Закоммить и запушь изменения в `main` без вопросов.
 7. Если задача большая — сначала обнови раздел 8 (план), потом код.
+8. Не коммить `state.enc` и тестовые домашние каталоги.

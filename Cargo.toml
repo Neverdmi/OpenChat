@@ -5,6 +5,8 @@ members = [
     "crates/oc-wire",
     "crates/oc-transport",
     "crates/oc-relay",
+    "crates/oc-client",
+    "crates/oc-cli",
 ]
 
 [workspace.package]

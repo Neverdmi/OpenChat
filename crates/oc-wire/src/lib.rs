@@ -48,6 +48,14 @@ pub enum ClientMessage {
         /// Event to store.
         event: RelayEvent,
     },
+    /// Subscribe to one or more mailboxes on an open connection.
+    Subscribe {
+        /// One-shot mailbox public keys.
+        #[serde(with = "hex32_vec")]
+        mailboxes: Vec<[u8; 32]>,
+        /// Replay events newer than this UNIX timestamp.
+        since: u64,
+    },
     /// Liveness check.
     Ping,
 }
@@ -63,6 +71,8 @@ pub enum ServerMessage {
     },
     /// Acknowledgement of a successful publish.
     Published,
+    /// Acknowledgement of a subscription request.
+    Subscribed,
     /// Reply to [`ClientMessage::Ping`].
     Pong,
     /// Publish or protocol error.
@@ -134,6 +144,34 @@ mod b64 {
     }
 }
 
+mod hex32_vec {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &[[u8; 32]], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded: Vec<String> = value.iter().map(hex::encode).collect();
+        encoded.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<[u8; 32]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = Vec::<String>::deserialize(deserializer)?;
+        encoded
+            .into_iter()
+            .map(|text| {
+                hex::decode(&text)
+                    .map_err(serde::de::Error::custom)?
+                    .try_into()
+                    .map_err(|_| serde::de::Error::custom("expected 32 bytes"))
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +204,25 @@ mod tests {
 
         let pong: ServerMessage = serde_json::from_str(r#"{"type":"pong"}"#).unwrap();
         assert_eq!(pong, ServerMessage::Pong);
+    }
+
+    #[test]
+    fn subscribe_message_roundtrip() {
+        let subscribe = ClientMessage::Subscribe {
+            mailboxes: vec![[1u8; 32], [0xABu8; 32]],
+            since: 1234,
+        };
+        let json = serde_json::to_string(&subscribe).unwrap();
+        assert!(json.starts_with(r#"{"type":"subscribe""#));
+        assert!(json.contains("ababab"));
+        let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, subscribe);
+
+        assert!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"type":"subscribe","mailboxes":["00"],"since":0}"#
+            )
+            .is_err()
+        );
     }
 }

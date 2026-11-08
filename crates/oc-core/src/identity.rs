@@ -57,6 +57,27 @@ impl Identity {
     pub fn peer_id(&self) -> [u8; 32] {
         self.public().peer_id()
     }
+
+    /// Serialize the private identity as `Ed25519 seed(32) || X25519 secret(32)`.
+    ///
+    /// The returned value is secret material and must only be written to
+    /// encrypted storage.
+    pub fn to_bytes(&self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&self.signing.to_bytes());
+        out[32..].copy_from_slice(&self.dh.to_bytes());
+        out
+    }
+
+    /// Restore an identity from [`Identity::to_bytes`].
+    pub fn from_bytes(bytes: &[u8; 64]) -> Self {
+        let signing_bytes: [u8; 32] = bytes[..32].try_into().expect("length checked");
+        let dh_bytes: [u8; 32] = bytes[32..].try_into().expect("length checked");
+        Self {
+            signing: SigningKey::from_bytes(&signing_bytes),
+            dh: StaticSecret::from(dh_bytes),
+        }
+    }
 }
 
 /// Public half of an identity.
@@ -150,5 +171,16 @@ mod tests {
         let id = Identity::generate();
         assert_eq!(id.peer_id(), id.public().peer_id());
         assert_ne!(id.peer_id(), Identity::generate().peer_id());
+    }
+
+    #[test]
+    fn private_identity_roundtrip() {
+        let id = Identity::generate();
+        let restored = Identity::from_bytes(&id.to_bytes());
+        assert_eq!(restored.peer_id(), id.peer_id());
+        assert_eq!(restored.public(), id.public());
+
+        let signature = restored.sign(b"persisted");
+        id.public().verify(b"persisted", &signature).unwrap();
     }
 }

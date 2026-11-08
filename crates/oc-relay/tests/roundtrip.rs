@@ -97,6 +97,33 @@ async fn limits_are_enforced() {
 }
 
 #[tokio::test]
+async fn multiple_mailboxes_share_one_subscription() {
+    let url = start_relay(RelayConfig::default()).await;
+    let client = RelayClient::from_url(&url).unwrap();
+
+    let first = [10u8; 32];
+    let second = [11u8; 32];
+    let mut stream = client.subscribe_many(&[first, second], 0).await.unwrap();
+
+    let event_a = RelayEvent::new(first, b"one".to_vec(), 3600);
+    let event_b = RelayEvent::new(second, b"two".to_vec(), 3600);
+    client.publish(&event_a).await.unwrap();
+    client.publish(&event_b).await.unwrap();
+
+    let mut received = Vec::new();
+    while received.len() < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("timed out waiting for events")
+            .expect("stream ended")
+            .expect("relay error");
+        received.push(event.payload);
+    }
+    received.sort();
+    assert_eq!(received, vec![b"one".to_vec(), b"two".to_vec()]);
+}
+
+#[tokio::test]
 async fn pool_publishes_to_a_relay() {
     let url = start_relay(RelayConfig::default()).await;
     let pool = RelayPool::from_urls([url]).unwrap();
