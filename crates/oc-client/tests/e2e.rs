@@ -39,6 +39,8 @@ async fn two_clients_exchange_text_through_a_relay() {
     // Bob publishes an invite; Alice adds him and sends the handshake.
     let invite = bob.invite().unwrap();
     assert!(invite.starts_with("openchat://v1/"));
+    // Short invite: Bob must publish his bundle before Alice can fetch it.
+    bob.listen_once(&pool, Duration::from_millis(500), 0).await.unwrap();
     let summary = alice.add_invite(&invite, &pool, 1).await.unwrap();
     assert_eq!(summary.peer_id, bob_id);
     assert_eq!(summary.delivered, 1);
@@ -124,6 +126,7 @@ async fn state_and_sessions_survive_restart() {
         let bob_id = bob.peer_id().unwrap();
 
         let invite = bob.invite().unwrap();
+        bob.listen_once(&pool, Duration::from_millis(500), 0).await.unwrap();
         alice.add_invite(&invite, &pool, 1).await.unwrap();
         bob.listen_once(&pool, Duration::from_millis(500), 0)
             .await
@@ -190,6 +193,7 @@ async fn multiple_relays_with_one_dead_still_deliver() {
     let bob_id = bob.peer_id().unwrap();
 
     let invite = bob.invite().unwrap();
+    bob.listen_once(&pool, Duration::from_millis(500), 0).await.unwrap();
     let summary = alice.add_invite(&invite, &pool, 2).await.unwrap();
     assert_eq!(summary.delivered, 1);
     assert!(!summary.queued);
@@ -229,9 +233,9 @@ async fn old_invites_still_work_after_prekey_rotation() {
     let bob_id = bob.peer_id().unwrap();
     let carol_id = carol.peer_id().unwrap();
 
-    let old_invite = bob.invite().unwrap();
+    let old_invite = bob.invite_full().unwrap();
     bob.rotate_prekeys().unwrap();
-    let new_invite = bob.invite().unwrap();
+    let new_invite = bob.invite_full().unwrap();
     assert_ne!(old_invite, new_invite);
     assert_eq!(bob.prekey_count(), 2);
 
@@ -289,6 +293,7 @@ async fn listen_survives_relay_outage_and_messages_are_redelivered() {
     let alice_id = alice.peer_id().unwrap();
 
     let invite = bob.invite().unwrap();
+    bob.listen_once(&pool, Duration::from_millis(500), 0).await.unwrap();
     alice.add_invite(&invite, &pool, 1).await.unwrap();
     bob.listen_once(&pool, Duration::from_millis(400), 0)
         .await
@@ -350,7 +355,9 @@ async fn offline_messages_deliver_and_are_acknowledged_after_reconnect() {
     let bob_id = bob.peer_id().unwrap();
 
     // Relay is down: both the handshake and the text stay in the outbox.
-    let invite = bob.invite().unwrap();
+    // A full invite is used here because a short invite would need a
+    // live relay to fetch the bundle from.
+    let invite = bob.invite_full().unwrap();
     let summary = alice.add_invite(&invite, &pool, 1).await.unwrap();
     assert!(summary.queued);
     assert_eq!(alice.outbox().len(), 1);

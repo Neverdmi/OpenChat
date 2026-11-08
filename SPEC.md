@@ -66,8 +66,14 @@ version(1) | IK_sign(32) | IK_dh(32) | SPK(32) | created_at(8)
 
 ### Invite
 ```
-openchat://v1/<peer_id_b32>/<bundle_b64>[/<relay_hints_b64>]
+openchat://v1/<peer_id_b32>[/<relay_hints_b64>]                        (короткая)
+openchat://v1/<peer_id_b32>/<bundle_b64>[/<relay_hints_b64>]          (полная)
 ```
+- Короткая форма (по умолчанию, ~70 символов): только peer id; bundle
+  забирается с bundle-mailbox (раздел 4.2).
+- Полная форма: bundle встроен в ссылку (~1.9 КБ, в основном из-за
+  ML-KEM-ключа); нужна, когда bundle нельзя забрать с релеев
+  (например, релей недоступен). Принимается для совместимости.
 - `peer_id_b32` — PeerID без padding, base32 (uppercase).
 - `bundle_b64` — bundle из раздела выше, base64url без padding.
 - `relay_hints_b64` — необязательный сегмент: base64url от списка URL,
@@ -143,6 +149,27 @@ mailbox           = SPK_B
   Одноразовые handshake-ящики появятся вместе с one-time prekeys.
 - Повторный Initiation с тем же transcript игнорируется; новый transcript
   заменяет сессию (пересоздание рукопожатия).
+
+### 4.2 Bundle-mailbox (короткие invite)
+
+Короткий invite не несёт bundle, поэтому владелец публикует подписанный
+bundle на **bundle-mailbox**, адрес которого выводится из peer id
+(публичный вход, поэтому адрес вычислим без секретов):
+
+```
+bundle_secret = HKDF-SHA256(salt="", ikm=PeerID, info="openchat/bundle-mailbox/v1", 32)
+bundle_mailbox = X25519_base(bundle_secret)
+wire           = seal(bundle_mailbox, bundle_bytes)
+```
+
+- Клиент публикует bundle при каждом `listen` (троттлинг 5 минут на
+  сессию); на store-and-forward релеях событие живёт по TTL, на
+  live-only носителях (MQTT) владелец должен быть онлайн.
+- Инициатор с коротким invite подписывается на bundle-mailbox и ждёт
+  событие (тайм-авт ~15 c), затем проверяет подпись bundle и совпадение
+  peer id — подменить bundle без identity-ключа нельзя.
+- Публикация bundle не раскрывает ничего сверх того, что уже есть
+  в полном invite (bundle подписан и публичен по дизайну).
 
 ---
 

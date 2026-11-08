@@ -1,11 +1,14 @@
 //! `openchat://` invite links.
 //!
 //! ```text
-//! openchat://v1/<peer_id_base32>/<bundle_base64url>[/<relay_hints_base64url>]
+//! openchat://v1/<peer_id_base32>[/<relay_hints_base64url>]            (short)
+//! openchat://v1/<peer_id_base32>/<bundle_base64url>[/<relay_hints_base64url>]  (full, legacy)
 //! ```
 //!
-//! The bundle is self-signed and carries the responder's long-term identity,
-//! signed prekey and ML-KEM-768 encapsulation key. Relay hints are optional
+//! The short form carries only the peer id (~70 characters); the invitee
+//! fetches the self-signed bundle from the peer's bundle mailbox on the
+//! relays (SPEC §4.2). The full form embeds the bundle directly and is
+//! still accepted for compatibility. Relay hints are optional
 //! newline-separated URLs encoded with base64url.
 
 use base64::Engine;
@@ -26,20 +29,31 @@ pub const MAX_RELAY_HINTS: usize = 16;
 pub struct Invite {
     /// Self-certifying peer identifier.
     pub peer_id: [u8; 32],
-    /// Signed prekey bundle.
-    pub bundle: PrekeyBundle,
+    /// Signed prekey bundle, when embedded (full form). `None` for the
+    /// short form: the bundle is fetched from the bundle mailbox.
+    pub bundle: Option<PrekeyBundle>,
     /// Recommended relays (may be empty).
     pub relays: Vec<String>,
 }
 
 impl Invite {
-    /// Build an invite, validating the bundle and relay hints.
+    /// Build a full invite, validating the bundle and relay hints.
     pub fn new(bundle: PrekeyBundle, relays: Vec<String>) -> Result<Self> {
         bundle.verify()?;
         validate_relays(&relays)?;
         Ok(Self {
             peer_id: bundle.identity.peer_id(),
-            bundle,
+            bundle: Some(bundle),
+            relays,
+        })
+    }
+
+    /// Build a short invite: peer id only, bundle fetched from relays.
+    pub fn short(peer_id: [u8; 32], relays: Vec<String>) -> Result<Self> {
+        validate_relays(&relays)?;
+        Ok(Self {
+            peer_id,
+            bundle: None,
             relays,
         })
     }
@@ -47,8 +61,13 @@ impl Invite {
     /// Encode to an `openchat://v1/...` string.
     pub fn encode(&self) -> String {
         let peer = BASE32_NOPAD.encode(&self.peer_id);
-        let bundle = URL_SAFE_NO_PAD.encode(self.bundle.to_bytes());
-        let mut link = format!("{INVITE_PREFIX}{peer}/{bundle}");
+        let mut link = match &self.bundle {
+            Some(bundle) => {
+                let encoded = URL_SAFE_NO_PAD.encode(bundle.to_bytes());
+                format!("{INVITE_PREFIX}{peer}/{encoded}")
+            }
+            None => format!("{INVITE_PREFIX}{peer}"),
+        };
         if !self.relays.is_empty() {
             let hints = URL_SAFE_NO_PAD.encode(self.relays.join("\n").as_bytes());
             link.push('/');
@@ -61,12 +80,11 @@ impl Invite {
     pub fn decode(link: &str) -> Result<Self> {
         let link = link.trim();
         let rest = link.strip_prefix(INVITE_PREFIX).ok_or(Error::Invite)?;
-        let mut parts = rest.split('/');
+        let mut parts = rest.split('/').filter(|part| !part.is_empty());
 
         let peer_part = parts.next().ok_or(Error::Invite)?;
-        let bundle_part = parts.next().ok_or(Error::Invite)?;
-        let relays_part = parts.next();
-        if parts.next().is_some() {
+        let rest: Vec<&str> = parts.collect();
+        if rest.len() > 2 {
             return Err(Error::Invite);
         }
 
@@ -75,15 +93,23 @@ impl Invite {
             .map_err(|_| Error::Invite)?;
         let peer_id: [u8; 32] = peer_bytes.try_into().map_err(|_| Error::Invite)?;
 
-        let bundle_bytes = URL_SAFE_NO_PAD
-            .decode(bundle_part)
-            .map_err(|_| Error::Invite)?;
-        let bundle = PrekeyBundle::from_bytes(&bundle_bytes)?;
-        bundle.verify()?;
-
-        if bundle.identity.peer_id() != peer_id {
-            return Err(Error::Invite);
-        }
+        // With two extra segments the middle one must be a bundle
+        // (full form with hints). With one extra segment, try the bundle
+        // first and fall back to relay hints (short form with hints):
+        // a hints payload decodes to URLs and never to a valid signed
+        // bundle, and a bundle never validates as relay URLs.
+        let (bundle, relays_part) = match rest.as_slice() {
+            [] => (None, None),
+            [only] => match parse_bundle(only, &peer_id) {
+                Some(bundle) => (Some(bundle), None),
+                None => (None, Some(*only)),
+            },
+            [bundle_part, hints_part] => {
+                let bundle = parse_bundle(bundle_part, &peer_id).ok_or(Error::Invite)?;
+                (Some(bundle), Some(*hints_part))
+            }
+            _ => return Err(Error::Invite),
+        };
 
         let relays = match relays_part {
             Some("") | None => Vec::new(),
@@ -117,6 +143,18 @@ pub fn peer_id_base32(peer_id: &[u8; 32]) -> String {
 pub fn short_peer_id(peer_id: &[u8; 32]) -> String {
     let encoded = peer_id_base32(peer_id);
     encoded[..10.min(encoded.len())].to_string()
+}
+
+/// Parse a bundle segment; `None` when it is not a valid signed bundle
+/// for `peer_id` (e.g. it is actually relay hints).
+fn parse_bundle(encoded: &str, peer_id: &[u8; 32]) -> Option<PrekeyBundle> {
+    let bundle_bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    let bundle = PrekeyBundle::from_bytes(&bundle_bytes).ok()?;
+    bundle.verify().ok()?;
+    if bundle.identity.peer_id() != *peer_id {
+        return None;
+    }
+    Some(bundle)
 }
 
 fn validate_relays(relays: &[String]) -> Result<()> {
@@ -161,8 +199,29 @@ mod tests {
         assert_eq!(decoded.bundle, invite.bundle);
         assert_eq!(decoded.relays, invite.relays);
 
-        let bare = Invite::new(invite.bundle.clone(), Vec::new()).unwrap();
+        let bare = Invite::new(invite.bundle.clone().unwrap(), Vec::new()).unwrap();
         let decoded = Invite::decode(&bare.encode()).unwrap();
+        assert!(decoded.relays.is_empty());
+    }
+
+    #[test]
+    fn short_invite_roundtrip_is_compact() {
+        let (full, _) = invite();
+        let short = Invite::short(full.peer_id, vec!["https://relay.example".into()]).unwrap();
+        let encoded = short.encode();
+        // Short form: peer id only, ~70 characters, no bundle segment.
+        assert!(encoded.len() < 200, "encoded len {}", encoded.len());
+        assert!(short.bundle.is_none());
+
+        let decoded = Invite::decode(&encoded).unwrap();
+        assert_eq!(decoded.peer_id, full.peer_id);
+        assert!(decoded.bundle.is_none());
+        assert_eq!(decoded.relays, vec!["https://relay.example"]);
+
+        // Without hints it is just the peer id.
+        let bare = Invite::short(full.peer_id, Vec::new()).unwrap();
+        let decoded = Invite::decode(&bare.encode()).unwrap();
+        assert!(decoded.bundle.is_none());
         assert!(decoded.relays.is_empty());
     }
 
@@ -192,6 +251,7 @@ mod tests {
         let bob = Identity::generate();
         let (_, bundle) = PrekeyPair::generate(&bob);
         assert!(Invite::new(bundle.clone(), vec!["ftp://relay.example".into()]).is_err());
+        assert!(Invite::short([1u8; 32], vec!["ftp://relay.example".into()]).is_err());
         assert!(Invite::new(bundle, vec!["not a url".into()]).is_err());
     }
 

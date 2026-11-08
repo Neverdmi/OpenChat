@@ -2,9 +2,9 @@
 
 Обновлено: 2026-11-09
 Ветка: `main`
-Версия: 0.1.19 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.20)
+Версия: 0.1.20 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.21)
 Статус: P4 почти готов (свой релей не развёрнут; default.json заполнен публичными MQTT-брокерами); P5 — CLI и TUI готовы (GUI удалён), осталась упаковка
-Тестов: 93 (+11 oc-tui, вне default-members)
+Тестов: 95 (+11 oc-tui, вне default-members)
 
 > Этот файл — точка входа для ИИ-агентов. Прочитай его и `SPEC.md`
 > перед любыми изменениями. После каждого завершённого этапа обновляй
@@ -75,7 +75,8 @@ openchat/
   `PrekeyPair` serialization, transcript.
 - `ratchet.rs` — Double Ratchet, `RatchetSnapshot` (serde) + `from_snapshot`.
 - `seal.rs` — sealed sender (релей не видит отправителя).
-- `mailbox.rs` — 32 одноразовых адреса на сутки.
+- `mailbox.rs` — 32 одноразовых адреса на сутки + bundle-mailbox
+  (деривация из peer id для коротких invite).
 - `frame.rs` — паддинг в 256/1024/4096/16384.
 - `aead.rs`, `kdf.rs` — XChaCha20-Poly1305, HKDF-SHA256.
 
@@ -114,9 +115,13 @@ openchat/
   флаг `verified`.
 - `store.rs` — `state.enc`: magic || Argon2id salt || nonce || ciphertext.
   Argon2id `m=19456,t=2,p=1`; запись `0600`, атомарная через rename.
-- `invite.rs` — `openchat://v1/<peer_b32>/<bundle_b64>[/<relays_b64>]`.
-  Встроенные дефолтные релеи в hints не кладутся (уже есть у всех) —
-  invite ~1.9 KB вместо ~2.9 KB.
+- `invite.rs` — короткая форма `openchat://v1/<peer_b32>` (~70 символов,
+  bundle забирается с bundle-mailbox, SPEC §4.2) + полная форма для
+  совместимости (`invite_full()`, `oc invite --full`). Встроенные
+  дефолтные релеи в hints не кладутся.
+- Bundle публикуется в `listen_once` (троттлинг 5 мин/сессия) на
+  bundle-mailbox `HKDF(peer_id, "openchat/bundle-mailbox/v1")`;
+  `add_invite` с коротким invite забирает и верифицирует bundle.
 - `message.rs` — text body (`msg_id`, timestamp, UTF-8) и inner envelope
   (`kind=1` handshake, `kind=2` ratchet text).
 - `client.rs` — `Client::{create,open,invite,add_invite,send_text,listen_once,
@@ -204,7 +209,7 @@ cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Ожидаемо: 93 теста. Ручная проверка релея:
+Ожидаемо: 95 тестов. Ручная проверка релея:
 
 ```bash
 cargo run -p oc-relay -- --listen 127.0.0.1:8080

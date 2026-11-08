@@ -110,10 +110,19 @@ enum Processed {
     ContactAdded([u8; 32]),
 }
 
+/// How often the signed bundle is re-published to the bundle mailbox,
+/// in seconds. Live-only carriers (MQTT) keep nothing, so the bundle
+/// must be refreshed while the owner is online.
+const BUNDLE_PUBLISH_INTERVAL: u64 = 300;
+/// How long to wait for a bundle when following a short invite.
+const BUNDLE_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// OpenChat client: encrypted state plus protocol operations.
 pub struct Client {
     state: ClientState,
     store: StateStore,
+    /// Last bundle publish (UNIX seconds, session-only throttle).
+    last_bundle_publish: u64,
 }
 
 impl core::fmt::Debug for Client {
@@ -130,7 +139,11 @@ impl Client {
     pub fn create(store: StateStore, relays: Vec<String>) -> Result<Self> {
         let state = ClientState::generate(relays)?;
         store.save(&state)?;
-        Ok(Self { state, store })
+        Ok(Self {
+            state,
+            store,
+            last_bundle_publish: 0,
+        })
     }
 
     /// Open and validate existing state, rotating prekeys when due.
@@ -139,7 +152,11 @@ impl Client {
         if state.rotate_prekeys_if_due(now_unix())? {
             store.save(&state)?;
         }
-        Ok(Self { state, store })
+        Ok(Self {
+            state,
+            store,
+            last_bundle_publish: 0,
+        })
     }
 
     /// Local peer id.
@@ -169,10 +186,22 @@ impl Client {
 
     /// Build the invite link for this identity.
     ///
-    /// Built-in default relays are not embedded as hints: every client
-    /// already has them, so they would only bloat the link by hundreds
-    /// of characters. Only user-added relays are carried in the invite.
+    /// Short form: peer id only (~70 characters). Built-in default
+    /// relays are not embedded as hints either — every client already
+    /// has them. The invitee fetches the signed bundle from this
+    /// client's bundle mailbox (SPEC §4.2).
     pub fn invite(&self) -> Result<String> {
+        let peer_id = self.state.peer_id()?;
+        let invite = Invite::short(peer_id, invite_hints(&self.state.relays))?;
+        Ok(invite.encode())
+    }
+
+    /// Build a full invite with the bundle embedded.
+    ///
+    /// Works without a bundle fetch (the invitee need not wait for the
+    /// owner to be online), at the cost of a much longer link. Prefer
+    /// the short [`Client::invite`] unless offline exchange matters.
+    pub fn invite_full(&self) -> Result<String> {
         let invite = Invite::new(self.state.bundle()?, invite_hints(&self.state.relays))?;
         Ok(invite.encode())
     }
@@ -207,6 +236,10 @@ impl Client {
         fanout: usize,
     ) -> Result<ContactSummary> {
         let invite = Invite::decode(invite_text)?;
+        let bundle = match invite.bundle.clone() {
+            Some(bundle) => bundle,
+            None => fetch_bundle(pool, &invite.peer_id).await?,
+        };
         let me = self.state.identity()?;
         let my_public = me.public();
 
@@ -214,22 +247,22 @@ impl Client {
         // confirmed contact. An unverified record may be replaced because the
         // previous handshake was never proved by a ratchet message.
         if let Some(existing) = self.state.contact(&invite.peer_id) {
-            let keys_changed = existing.ed != invite.bundle.identity.ed_bytes()
-                || existing.dh != invite.bundle.identity.dh_bytes();
+            let keys_changed = existing.ed != bundle.identity.ed_bytes()
+                || existing.dh != bundle.identity.dh_bytes();
             if keys_changed && existing.verified {
                 return Err(Error::Tofu);
             }
         }
 
-        let (initiation, session_key) = x3dh::initiate(&me, &invite.bundle)?;
-        let transcript = x3dh::transcript(&initiation, &invite.bundle.identity);
+        let (initiation, session_key) = x3dh::initiate(&me, &bundle)?;
+        let transcript = x3dh::transcript(&initiation, &bundle.identity);
         let ratchet = Ratchet::new_initiator(
             &session_key,
-            &invite.bundle.signed_prekey,
+            &bundle.signed_prekey,
             transcript.clone(),
         );
         let mailbox_root = x3dh::mailbox_root(&session_key);
-        let safety = safety_number(&my_public, &invite.bundle.identity);
+        let safety = safety_number(&my_public, &bundle.identity);
 
         let existing_created_at = self
             .state
@@ -238,8 +271,8 @@ impl Client {
             .unwrap_or_else(created_now);
 
         let contact = new_contact(
-            &invite.bundle.identity,
-            Some(invite.bundle.digest()),
+            &bundle.identity,
+            Some(bundle.digest()),
             mailbox_root,
             transcript,
             ratchet.snapshot(),
@@ -252,12 +285,12 @@ impl Client {
         // a one-time-friendly ECIES mailbox before any session exists.
         let padded = frame::pad(&initiation.to_bytes())?;
         let inner = Envelope::handshake(padded).encode();
-        let sealed = seal::seal(&invite.bundle.signed_prekey, &inner)?;
+        let sealed = seal::seal(&bundle.signed_prekey, &inner)?;
         let now = now_unix();
         let record = OutboxRecord {
             msg_id: random_array::<16>(),
             peer_id: invite.peer_id,
-            mailbox: invite.bundle.signed_prekey,
+            mailbox: bundle.signed_prekey,
             payload: sealed,
             created_at: now,
             expires_at: now.saturating_add(HANDSHAKE_TTL_SECONDS),
@@ -443,6 +476,32 @@ impl Client {
         }
     }
 
+    /// Publish the signed bundle to our bundle mailbox (throttled).
+    ///
+    /// Short invites carry only the peer id, so the bundle must be
+    /// fetchable from the relays while we are online. Live-only carriers
+    /// (MQTT) keep nothing, hence the periodic re-publish; store-and-
+    /// forward relays keep it for their TTL anyway.
+    async fn publish_bundle(&mut self, pool: &RelayPool) -> Result<()> {
+        let now = now_unix();
+        if now.saturating_sub(self.last_bundle_publish) < BUNDLE_PUBLISH_INTERVAL {
+            return Ok(());
+        }
+        let peer_id = self.state.peer_id()?;
+        let mailbox = mailbox::bundle_mailbox_public(&peer_id);
+        let payload = seal::seal(&mailbox, &self.state.bundle()?.to_bytes())?;
+        let event = RelayEvent {
+            mailbox,
+            created_at: now,
+            expires_at: now.saturating_add(MESSAGE_TTL_SECONDS),
+            payload,
+        };
+        if pool.publish(&event, DEFAULT_FANOUT).await.is_ok() {
+            self.last_bundle_publish = now;
+        }
+        Ok(())
+    }
+
     /// Receive and decrypt available events, returning after `idle` with no
     /// new events.
     ///
@@ -455,6 +514,7 @@ impl Client {
         since: u64,
     ) -> Result<ListenOutcome> {
         let _ = self.flush_due_outbox(pool, DEFAULT_FANOUT).await?;
+        let _ = self.publish_bundle(pool).await;
         let mut outcome = ListenOutcome::default();
         let mut pending_acks: Vec<([u8; 32], [u8; 16])> = Vec::new();
         let mut advanced = false;
@@ -793,6 +853,43 @@ fn invite_hints(relays: &[String]) -> Vec<String> {
         .filter(|relay| !defaults.contains(relay))
         .cloned()
         .collect()
+}
+
+/// Fetch a signed bundle from a peer's bundle mailbox (short invites).
+///
+/// The bundle is self-signed by the peer's identity key, so the fetched
+/// bytes are verified before use: a relay or broker cannot substitute a
+/// different bundle without the identity private key.
+async fn fetch_bundle(
+    pool: &RelayPool,
+    peer_id: &[u8; 32],
+) -> Result<oc_core::x3dh::PrekeyBundle> {
+    let mailbox = mailbox::bundle_mailbox_public(peer_id);
+    let secret = mailbox::bundle_mailbox_secret(peer_id);
+    let mut stream = pool.subscribe_all_many(&[mailbox], 0).await?;
+    let deadline = tokio::time::Instant::now() + BUNDLE_FETCH_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Invite);
+        }
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(event))) if event.mailbox == mailbox => {
+                let Ok(plaintext) = seal::open(&secret, &event.payload) else {
+                    continue;
+                };
+                let Ok(bundle) = oc_core::x3dh::PrekeyBundle::from_bytes(&plaintext) else {
+                    continue;
+                };
+                if bundle.verify().is_ok() && bundle.identity.peer_id() == *peer_id {
+                    return Ok(bundle);
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_))) | Ok(None) => return Err(Error::Invite),
+            Err(_) => return Err(Error::Invite),
+        }
+    }
 }
 
 /// Pick an unused mailbox slot for `epoch`, resetting the mask when exhausted.

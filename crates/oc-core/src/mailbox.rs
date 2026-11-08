@@ -66,6 +66,22 @@ pub fn epoch_of(unix_seconds: u64) -> u32 {
     (unix_seconds / EPOCH_SECONDS) as u32
 }
 
+/// Secret scalar of the bundle mailbox for `peer_id`.
+///
+/// The derivation input is public (the peer id is in every invite), so
+/// anyone can compute the mailbox address; only the owner — who can run
+/// the same derivation — holds the scalar to read it. The mailbox carries
+/// the owner's signed prekey bundle for short invites (see SPEC §4.2).
+pub fn bundle_mailbox_secret(peer_id: &[u8; 32]) -> [u8; 32] {
+    hkdf32(&[], peer_id, b"openchat/bundle-mailbox/v1")
+}
+
+/// Public address of the bundle mailbox for `peer_id`.
+pub fn bundle_mailbox_public(peer_id: &[u8; 32]) -> [u8; 32] {
+    let secret = StaticSecret::from(bundle_mailbox_secret(peer_id));
+    PublicKey::from(&secret).to_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +105,19 @@ mod tests {
         // Direction separation: Alice's own inbox is a different chain.
         let alice_inbox = MailboxChain::derive(&root, &alice, &bob);
         assert_ne!(alice_inbox.slot_public(10, 3), bob_view.slot_public(10, 3));
+    }
+
+    #[test]
+    fn bundle_mailbox_is_deterministic_and_peer_specific() {
+        let alice = [1u8; 32];
+        let bob = [2u8; 32];
+        assert_eq!(bundle_mailbox_public(&alice), bundle_mailbox_public(&alice));
+        assert_ne!(bundle_mailbox_public(&alice), bundle_mailbox_public(&bob));
+        // The public address is the X25519 public key of the secret.
+        let secret = bundle_mailbox_secret(&alice);
+        let expected =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret));
+        assert_eq!(bundle_mailbox_public(&alice), expected.to_bytes());
     }
 
     #[test]

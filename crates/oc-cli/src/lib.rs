@@ -43,7 +43,12 @@ enum Command {
     },
 
     /// Print this identity's invite link.
-    Invite,
+    Invite {
+        /// Embed the full signed bundle (long link, works offline-relay
+        /// style without a bundle fetch). Default is the short form.
+        #[arg(long)]
+        full: bool,
+    },
 
     /// Add a contact from an invite and send the X3DH handshake.
     Add {
@@ -142,10 +147,14 @@ async fn run_inner(argv: Vec<std::ffi::OsString>) -> Result<()> {
 
     match args.command {
         Command::Init { relays } => init(&args.home, relays),
-        Command::Invite => {
+        Command::Invite { full } => {
             let passphrase = passphrase(false)?;
             let client = open_client(&args.home, &passphrase)?;
-            println!("{}", client.invite()?);
+            if full {
+                println!("{}", client.invite_full()?);
+            } else {
+                println!("{}", client.invite()?);
+            }
             Ok(())
         }
         Command::Add {
