@@ -641,6 +641,32 @@ pub fn spawn_worker(client: Client, home: &std::path::Path, settings: Settings) 
     }
 }
 
+/// Built-in Tor bridges (obfs4 + webtunnel), embedded so Tor works in
+/// censored networks without manual torrc editing. Requires the
+/// pluggable-transport binaries `obfs4proxy` and `webtunnel-client`
+/// next to `tor` in PATH. Note: bridges in a public repo get blocked
+/// faster — replace them in `torrc_contents` when they die.
+const TOR_BRIDGES: &[&str] = &[
+    "obfs4 51.38.220.224:24885 54CE8314507E15AD7B5F61DEBA6372E46C2A07EB cert=jr7h5jLJLoot4ufBd+676hitBxRE3a05vcBzjmsavf300vvY+8TfCfWNJYxwr9T5SveJfg iat-mode=0",
+    "obfs4 51.161.81.197:65168 AC5FCFC2ACF33D3A800356E05D42BA68A7262AA3 cert=8mosjcVPEi3In4p/E+xGUC5sMSDKxXH2LG2SwkVK37deKnQwV6wPpHP3rRQuty3i3VbiNQ iat-mode=0",
+    "webtunnel [2001:db8:3ce4:c7c7:1316:3072:b8e9:b915]:443 07E8A7DFCA7B76DD0E2F1E8C6C74D9910AAF279E url=https://shenvalleygamers.com/7HxRIWqsmkPOemUcLFTGuPaW ver=0.0.4",
+    "webtunnel [2001:db8:71fb:a9be:f195:7fc:d1fa:3f41]:443 3D87781EE4EA775BFAA72B8F2D09C0BE489B6D71 url=https://104.36.85.19/bunt-senior-bucket ver=0.0.3",
+];
+
+/// torrc for the embedded Tor process: SOCKS port, data dir, bridges.
+fn torrc_contents(data_dir: &std::path::Path) -> String {
+    let mut torrc = format!(
+        "SocksPort 127.0.0.1:9050\nDataDirectory {}\nClientOnly 1\nLogLevel notice\n",
+        data_dir.to_string_lossy()
+    );
+    for bridge in TOR_BRIDGES {
+        torrc.push_str(&format!("Bridge {bridge}\n"));
+    }
+    torrc.push_str("ClientTransportPlugin obfs4 obfs4proxy\n");
+    torrc.push_str("ClientTransportPlugin webtunnel webtunnel-client\n");
+    torrc
+}
+
 /// Start a local `tor` process and wait for its SOCKS5 port.
 ///
 /// Returns the child process (killed when the worker exits) and the
@@ -650,23 +676,17 @@ fn start_tor(home: &std::path::Path, mode: TorMode) -> Result<(std::process::Chi
     let data_dir = home.join("tor-data");
     std::fs::create_dir_all(&data_dir)
         .map_err(|error| format!("tor data dir: {error}"))?;
+    let torrc_path = data_dir.join("torrc");
+    std::fs::write(&torrc_path, torrc_contents(&data_dir))
+        .map_err(|error| format!("torrc: {error}"))?;
     let mut child = std::process::Command::new("tor")
-        .args([
-            "--SocksPort",
-            "127.0.0.1:9050",
-            "--DataDirectory",
-            &data_dir.to_string_lossy(),
-            "--LogLevel",
-            "notice",
-            "--ClientOnly",
-            "1",
-        ])
+        .args(["-f", &torrc_path.to_string_lossy()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|error| {
-            format!("tor binary not found ({error}); install tor to use Tor mode")
+            format!("tor binary not found ({error}); install tor + obfs4proxy + webtunnel-client to use Tor mode")
         })?;
     for _ in 0..60 {
         if TcpStream::connect("127.0.0.1:9050").is_ok() {
@@ -688,7 +708,10 @@ fn start_tor(home: &std::path::Path, mode: TorMode) -> Result<(std::process::Chi
         }
     }
     let _ = child.kill();
-    Err("tor did not open its SOCKS port in time".to_string())
+    Err(
+        "tor did not open its SOCKS port in time (check tor + obfs4proxy + webtunnel-client are installed and bridges are alive)"
+            .to_string(),
+    )
 }
 
 async fn worker_loop(
@@ -924,6 +947,18 @@ mod tests {
 
         app.confirm_passphrase = "long-enough-passphrase".to_string();
         assert!(app.validate_create().is_ok());
+    }
+
+    #[test]
+    fn torrc_contains_bridges_and_plugins() {
+        let torrc = torrc_contents(std::path::Path::new("/tmp/tor-data"));
+        assert!(torrc.contains("SocksPort 127.0.0.1:9050"));
+        assert!(torrc.contains("Bridge obfs4 51.38.220.224:24885"));
+        assert!(torrc.contains("Bridge obfs4 51.161.81.197:65168"));
+        assert!(torrc.contains("Bridge webtunnel [2001:db8:3ce4:c7c7:1316:3072:b8e9:b915]:443"));
+        assert!(torrc.contains("Bridge webtunnel [2001:db8:71fb:a9be:f195:7fc:d1fa:3f41]:443"));
+        assert!(torrc.contains("ClientTransportPlugin obfs4 obfs4proxy"));
+        assert!(torrc.contains("ClientTransportPlugin webtunnel webtunnel-client"));
     }
 
     #[test]

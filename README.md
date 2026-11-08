@@ -162,7 +162,9 @@ OPENCHAT_PASSPHRASE='alice-passphrase' ./target/debug/oc --home /tmp/alice chat 
 
 Tor-режим: `always` гонит весь трафик через Tor SOCKS5 и падает
 закрыто (без прямого соединения), если Tor недоступен; `fallback`
-пробует напрямую и только при ошибке идёт через Tor.
+пробует напрямую и только при ошибке идёт через Tor. Нужны бинарники
+`tor` + `obfs4proxy` + `webtunnel-client` в PATH; мосты (obfs4/webtunnel)
+уже вшиты в генерируемый torrc.
 
 GUI-версия (egui) удалена: TUI оказался удобнее, в одной программе
 остаются только TUI и CLI.
