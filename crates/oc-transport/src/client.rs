@@ -17,7 +17,7 @@ const WS_PATH: &str = "/ws";
 
 static INSTALL_PROVIDER: Once = Once::new();
 
-fn install_crypto_provider() {
+pub(crate) fn install_crypto_provider() {
     INSTALL_PROVIDER.call_once(|| {
         // tokio-tungstenite builds rustls without a default provider. We
         // explicitly enable `ring` (no cmake/aws-lc build dependency).

@@ -1,4 +1,10 @@
 {
   "version": 1,
-  "relays": []
+  "relays": [
+    { "url": "mqtts://broker.hivemq.com:8884/mqtt", "note": "HiveMQ public broker (MQTT over WSS)" },
+    { "url": "mqtttls://broker.hivemq.com:8883", "note": "HiveMQ public broker (MQTT over native TLS)" },
+    { "url": "mqtts://broker.emqx.io:8084/mqtt", "note": "EMQX public broker (MQTT over WSS)" },
+    { "url": "mqtttls://broker.emqx.io:8883", "note": "EMQX public broker (MQTT over native TLS)" },
+    { "url": "mqtts://test.mosquitto.org:8081/", "note": "Eclipse Mosquitto test broker (MQTT over WSS, intermittent)" }
+  ]
 }

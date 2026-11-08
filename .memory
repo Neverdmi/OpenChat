@@ -2,8 +2,8 @@
 
 Обновлено: 2026-11-08
 Ветка: `main`
-Статус: P4 почти готов (остался только деплой публичного релея); P5 — CLI и desktop готовы, остались TUI/упаковка
-Тестов: 90 (+7 в oc-desktop, вне default-members)
+Статус: P4 почти готов (свой релей не развёрнут; default.json заполнен публичными MQTT-брокерами); P5 — CLI и desktop готовы, остались TUI/упаковка
+Тестов: 91 (+7 в oc-desktop, вне default-members)
 
 > Этот файл — точка входа для ИИ-агентов. Прочитай его и `SPEC.md`
 > перед любыми изменениями. После каждого завершённого этапа обновляй
@@ -62,7 +62,8 @@ openchat/
     oc-cli/                CLI `oc` (библиотека + тонкий бинарник)
     oc-desktop/            десктоп `oc-desktop` (egui; `--cli` → тот же CLI);
                            вне default-members, не входит в musl-сборку
-  relays/default.json      встроенный список релеев (пока пуст)
+  relays/default.json      встроенный список релеев: 5 публичных
+                           MQTT-брокеров (HiveMQ, EMQX, Mosquitto test)
 ```
 
 ### `oc-core`
@@ -87,12 +88,12 @@ openchat/
 ### `oc-transport`
 - `Carrier` trait: `health`, `publish`, `subscribe`, `subscribe_many`.
 - `RelayClient` — WebSocket, TLS через rustls + ring.
-- `MqttClient` — MQTT 3.1.1 поверх WSS (без новых зависимостей):
+- `MqttClient` — MQTT 3.1.1 поверх WSS (`mqtts://…`, путь по умолчанию
+  `/mqtt`) или нативного TLS (`mqtttls://…`, обычно 8883):
   топик `openchat/v1/<mailbox hex>`, пейлоад — тот же JSON `RelayEvent`,
-  QoS 1, retained/will нет. Эндпоинт `mqtts://…` (путь по умолчанию
-  `/mqtt`); `RelayPool::add_url` выбирает носитель по схеме, в пуле
-  носители смешиваются. `since` не поддерживается (live-only) — офлайн
-  покрывает outbox клиента.
+  QoS 1, retained/will нет. `RelayPool::add_url` выбирает носитель
+  по схеме, в пуле носители смешиваются. `since` не поддерживается
+  (live-only) — офлайн покрывает outbox клиента.
 - `RelayPool` — fan-out, fallback, `subscribe_all_many` (merge всех релеев).
   Каждый поток в reconnect-loop (250 ms … 30 s). Две последовательные
   ошибки временно исключают релей из fan-out; health-check сбрасывает.
@@ -198,7 +199,7 @@ cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Ожидаемо: 90 тестов. Ручная проверка релея:
+Ожидаемо: 91 тест. Ручная проверка релея:
 
 ```bash
 cargo run -p oc-relay -- --listen 127.0.0.1:8080
@@ -236,7 +237,9 @@ curl http://127.0.0.1:8080/health
     но размеры состояния видны по файлу.
 
 ### Транспорт и релей
-12. `relays/default.json` пуст — без `--relay` клиент не заработает.
+12. ~~`relays/default.json` пуст~~ — заполнен публичными MQTT-брокерами
+    (HiveMQ, EMQX — проверены; Mosquitto test — периодически недоступен).
+    Свой `oc-relay` по-прежнему не развёрнут.
 13. На релее нет rate limiting / anti-DoS; только лимиты на ящик и payload.
 14. Нет event id: `since` работает по `created_at`, возможны дубли.
     MQTT-носитель — live-only: брокер не хранит историю, `since`
@@ -286,8 +289,11 @@ curl http://127.0.0.1:8080/health
      работает параллельно.
    - One-time prekeys (X3DH OPK) и handshake-mailbox на их основе — позже.
 4. **Пул релеев**
-   - Развернуть публичный релей, заполнить `relays/default.json`.
-   - Подписанный манифест, health-check, исключение мёртвых.
+   - `relays/default.json` заполнен публичными MQTT-брокерами (см.
+     `relays/README.md`); signed manifest, health-check и исключение
+     мёртвых готовы.
+   - Осталось: развернуть свой публичный `oc-relay` (нужен VPS/домен)
+     и добавить его в список.
 5. **MQTT-носитель** (WSS) как второй `Carrier` — готово
    - `MqttClient` в `oc-transport`: MQTT 3.1.1 поверх WSS без новых
      зависимостей, топик `openchat/v1/<mailbox>`, QoS 1, пейлоад —

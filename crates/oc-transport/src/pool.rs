@@ -71,14 +71,14 @@ impl RelayPool {
 
     /// Add a relay by URL.
     ///
-    /// `mqtts://`/`mqtt://` endpoints become an MQTT-over-WSS carrier
-    /// ([`MqttClient`]); everything else is a WebSocket relay
-    /// ([`RelayClient`]). Both are interchangeable in the pool, so one
-    /// [`RelayPool`] can mix carriers.
+    /// `mqtts://`/`mqtt://` endpoints become an MQTT-over-WSS carrier and
+    /// `mqtttls://` an MQTT-over-native-TLS carrier ([`MqttClient`]);
+    /// everything else is a WebSocket relay ([`RelayClient`]). All are
+    /// interchangeable in the pool, so one [`RelayPool`] can mix carriers.
     pub fn add_url(&mut self, url: &str) -> Result<()> {
         let parsed = Url::parse(url).map_err(|error| Error::Url(error.to_string()))?;
         match parsed.scheme() {
-            "mqtts" | "mqtt" => self.add(Arc::new(MqttClient::new(parsed))),
+            "mqtts" | "mqtt" | "mqtttls" => self.add(Arc::new(MqttClient::new(parsed))),
             _ => self.add(Arc::new(RelayClient::new(parsed))),
         }
         Ok(())
@@ -503,12 +503,13 @@ mod tests {
         let mut pool = RelayPool::new();
         pool.add_url("mqtts://broker.example/mqtt").unwrap();
         pool.add_url("mqtt://broker.example:1883/mqtt").unwrap();
-        assert_eq!(pool.len(), 2);
+        pool.add_url("mqtttls://broker.example:8883").unwrap();
+        assert_eq!(pool.len(), 3);
         let schemes: Vec<&str> = pool
             .endpoints()
             .iter()
             .map(|url| url.scheme())
             .collect();
-        assert_eq!(schemes, vec!["mqtts", "mqtt"]);
+        assert_eq!(schemes, vec!["mqtts", "mqtt", "mqtttls"]);
     }
 }

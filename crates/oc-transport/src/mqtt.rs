@@ -1,4 +1,4 @@
-//! MQTT carrier over WebSocket Secure (MQTT 3.1.1 over WSS).
+//! MQTT carrier (MQTT 3.1.1 over WSS or native TLS).
 //!
 //! Public MQTT brokers use a different set of domains and ASNs than
 //! WebSocket relays, which makes them a useful second carrier against
@@ -17,19 +17,24 @@
 //! - no retained messages, no will, clean session: the broker retains
 //!   nothing about a mailbox once the connection closes.
 //!
-//! The endpoint URL uses the `mqtts://` (or `mqtt://`) scheme and is
-//! translated to `wss://` (or `ws://`) for the WebSocket upgrade; the path
-//! is the broker's WebSocket path and defaults to `/mqtt`. Optional
-//! `user:pass@` userinfo is sent as MQTT username/password. Brokers that
-//! only listen on native TLS TCP (port 8883) are not supported by this
-//! carrier — use a WebSocket-capable broker endpoint instead.
+//! Two endpoint flavours, selected by scheme:
+//! - `mqtts://` (or `mqtt://`): MQTT over WebSocket. The URL is translated
+//!   to `wss://` (or `ws://`) for the upgrade; the path is the broker's
+//!   WebSocket path and defaults to `/mqtt` when missing (an explicit
+//!   `/` is kept for brokers like Mosquitto that only upgrade on `/`).
+//! - `mqtttls://`: MQTT over native TLS TCP (typically port 8883), no
+//!   WebSocket framing. The path is ignored.
+//!
+//! Optional `user:pass@` userinfo is sent as MQTT username/password.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use oc_core::random_array;
 use oc_wire::RelayEvent;
+use tokio::io::AsyncReadExt;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
@@ -56,9 +61,94 @@ const OP_PINGRESP: u8 = 13;
 /// Topic prefix for every mailbox.
 pub const TOPIC_PREFIX: &str = "openchat/v1/";
 
-type Socket = tokio_tungstenite::WebSocketStream<
+type WsSocket = tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
 >;
+type TlsSocket = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
+
+/// One MQTT connection, either over WebSocket or native TLS TCP.
+enum Conn {
+    /// MQTT over WebSocket Secure.
+    Ws(Box<WsSocket>),
+    /// MQTT over native TLS TCP.
+    Tls(Box<TlsSocket>),
+}
+
+impl Conn {
+    /// Send one MQTT packet.
+    async fn send_packet(&mut self, packet: Vec<u8>) -> Result<()> {
+        match self {
+            Conn::Ws(socket) => socket
+                .send(Message::Binary(packet.into()))
+                .await
+                .map_err(Error::Ws),
+            Conn::Tls(socket) => {
+                use tokio::io::AsyncWriteExt;
+                socket
+                    .write_all(&packet)
+                    .await
+                    .map_err(|error| Error::Relay(format!("tls write: {error}")))?;
+                socket
+                    .flush()
+                    .await
+                    .map_err(|error| Error::Relay(format!("tls write: {error}")))?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Receive one MQTT packet, or `None` on a clean EOF.
+    async fn recv_packet(&mut self) -> Result<Option<Vec<u8>>> {
+        match self {
+            Conn::Ws(socket) => loop {
+                match socket.next().await {
+                    Some(Ok(Message::Binary(data))) => return Ok(Some(data.to_vec())),
+                    Some(Ok(Message::Close(_))) | None => return Ok(None),
+                    Some(Ok(_)) => continue,
+                    Some(Err(error)) => return Err(Error::Ws(error)),
+                }
+            },
+            Conn::Tls(socket) => read_tls_packet(socket).await,
+        }
+    }
+}
+
+/// Read one framed MQTT packet from a raw TLS byte stream.
+async fn read_tls_packet(socket: &mut TlsSocket) -> Result<Option<Vec<u8>>> {
+    let mut first = [0u8; 1];
+    match socket.read(&mut first).await {
+        Ok(0) => return Ok(None),
+        Ok(_) => {}
+        Err(error) => return Err(Error::Relay(format!("tls read: {error}"))),
+    }
+    // Remaining length: 1–4 bytes, 7 bits each, MSB = continuation.
+    let mut length: usize = 0;
+    let mut multiplier: usize = 1;
+    let mut packet = vec![first[0]];
+    loop {
+        let mut byte = [0u8; 1];
+        socket
+            .read_exact(&mut byte)
+            .await
+            .map_err(|error| Error::Relay(format!("tls read: {error}")))?;
+        packet.push(byte[0]);
+        length += (byte[0] as usize & 0x7F) * multiplier;
+        if byte[0] & 0x80 == 0 {
+            break;
+        }
+        multiplier *= 128;
+    }
+    if length > MAX_PAYLOAD {
+        return Err(Error::Relay("mqtt packet too large".into()));
+    }
+    let mut body = vec![0u8; length];
+    socket
+        .read_exact(&mut body)
+        .await
+        .map_err(|error| Error::Relay(format!("tls read: {error}")))?;
+    packet.extend_from_slice(&body);
+    Ok(Some(packet))
+}
 
 /// MQTT client for one broker endpoint.
 #[derive(Debug, Clone)]
@@ -69,11 +159,21 @@ pub struct MqttClient {
 impl MqttClient {
     /// Create a client from an already parsed URL.
     ///
-    /// Accepted schemes: `mqtts`, `mqtt`, `wss`, `ws`, `https`, `http`.
-    /// The `mqtt(s)://` scheme is how [`crate::RelayPool::add_url`]
-    /// recognises an MQTT endpoint; `ws(s)://` URLs are passed through.
+    /// Accepted schemes: `mqtts`, `mqtt`, `wss`, `ws`, `https`, `http`
+    /// (MQTT over WebSocket) and `mqtttls` (MQTT over native TLS TCP).
+    /// The `mqtt(s)://` and `mqtttls://` schemes are how
+    /// [`crate::RelayPool::add_url`] recognises an MQTT endpoint.
     pub fn new(base: Url) -> Self {
+        // Native TLS needs a process-level rustls provider (`ring`);
+        // the WebSocket path installs it too, this keeps MQTT usable
+        // on its own.
+        crate::client::install_crypto_provider();
         Self { base }
+    }
+
+    /// Whether this endpoint uses native TLS instead of WebSocket framing.
+    pub fn is_native_tls(&self) -> bool {
+        self.base.scheme() == "mqtttls"
     }
 
     /// Create a client from a string URL.
@@ -101,30 +201,91 @@ impl MqttClient {
         };
         let mut url = Url::parse(&format!("{scheme}://{rest}"))
             .map_err(|error| Error::Url(error.to_string()))?;
-        if url.path().is_empty() || url.path() == "/" {
+        // An explicit "/" is kept: Mosquitto's WebSocket listener only
+        // upgrades on "/" (its `websocket_path`), while HiveMQ/EMQX
+        // accept "/mqtt". A missing path defaults to "/mqtt". (After the
+        // scheme swap the URL parser normalises an empty path to "/", so
+        // the decision uses the original endpoint's path.)
+        if self.base.path().is_empty() {
             url.set_path("/mqtt");
         }
         Ok(url)
     }
 
-    async fn connect(&self) -> Result<Socket> {
-        let url = self.ws_url()?;
-        let (socket, _) = tokio::time::timeout(OP_TIMEOUT, connect_async(url.as_str()))
-            .await
-            .map_err(|_| Error::Timeout)??;
-        let mut socket = socket;
+    async fn connect(&self) -> Result<Conn> {
+        let mut conn = if self.is_native_tls() {
+            Conn::Tls(Box::new(self.connect_tls().await?))
+        } else {
+            Conn::Ws(Box::new(self.connect_ws().await?))
+        };
         let client_id = hex::encode(random_array::<16>());
         let packet = build_connect(
             &client_id,
             self.base.username(),
             self.base.password(),
         );
-        socket
-            .send(Message::Binary(packet.into()))
+        conn.send_packet(packet).await?;
+        wait_connack(&mut conn).await?;
+        Ok(conn)
+    }
+
+    async fn connect_ws(&self) -> Result<WsSocket> {
+        let url = self.ws_url()?;
+        // MQTT over WebSocket requires the `mqtt` subprotocol; strict
+        // brokers (e.g. Mosquitto) reject upgrades without it. A manual
+        // request must carry every WebSocket upgrade header itself —
+        // tungstenite only generates them for `&str` URLs.
+        use base64::Engine;
+        let key = base64::engine::general_purpose::STANDARD.encode(random_array::<16>());
+        let host = url
+            .host_str()
+            .ok_or_else(|| Error::Url("mqtt endpoint has no host".into()))?;
+        let host_header = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        let request = tokio_tungstenite::tungstenite::http::Request::builder()
+            .uri(url.as_str())
+            .header("Host", host_header)
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Key", key)
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Protocol", "mqtt")
+            .body(())
+            .map_err(|error| Error::Url(error.to_string()))?;
+        let (socket, _) = tokio::time::timeout(OP_TIMEOUT, connect_async(request))
             .await
-            .map_err(Error::Ws)?;
-        wait_connack(&mut socket).await?;
+            .map_err(|_| Error::Timeout)??;
         Ok(socket)
+    }
+
+    async fn connect_tls(&self) -> Result<TlsSocket> {
+        let host = self
+            .base
+            .host_str()
+            .ok_or_else(|| Error::Url("mqtt endpoint has no host".into()))?
+            .to_string();
+        let port = self.base.port().unwrap_or(8883);
+        let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+            .map_err(|_| Error::Url("invalid mqtt host".into()))?;
+        let tcp = tokio::time::timeout(
+            OP_TIMEOUT,
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|error| Error::Relay(format!("tcp connect: {error}")))?;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        tokio::time::timeout(OP_TIMEOUT, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|error| Error::Relay(format!("tls connect: {error}")))
     }
 }
 
@@ -135,13 +296,10 @@ impl Carrier for MqttClient {
     }
 
     async fn health(&self) -> Result<()> {
-        let mut socket = self.connect().await?;
-        socket
-            .send(Message::Binary(build_pingreq().into()))
-            .await
-            .map_err(Error::Ws)?;
+        let mut conn = self.connect().await?;
+        conn.send_packet(build_pingreq()).await?;
         loop {
-            let packet = next_packet(&mut socket).await?;
+            let packet = next_packet(&mut conn).await?;
             if packet_opcode(&packet) == OP_PINGRESP {
                 return Ok(());
             }
@@ -149,16 +307,14 @@ impl Carrier for MqttClient {
     }
 
     async fn publish(&self, event: &RelayEvent) -> Result<()> {
-        let mut socket = self.connect().await?;
+        let mut conn = self.connect().await?;
         let topic = topic_for(&event.mailbox);
         let payload = serde_json::to_vec(event)?;
         let packet_id = next_packet_id();
-        socket
-            .send(Message::Binary(build_publish(&topic, &payload, packet_id).into()))
-            .await
-            .map_err(Error::Ws)?;
+        conn.send_packet(build_publish(&topic, &payload, packet_id))
+            .await?;
         loop {
-            let packet = next_packet(&mut socket).await?;
+            let packet = next_packet(&mut conn).await?;
             if packet_opcode(&packet) == OP_PUBACK && parse_puback(&packet) == Some(packet_id) {
                 return Ok(());
             }
@@ -177,21 +333,19 @@ impl Carrier for MqttClient {
         if mailboxes.is_empty() {
             return Err(Error::Relay("no mailboxes requested".into()));
         }
-        let mut socket = self.connect().await?;
+        let mut conn = self.connect().await?;
         let topics: Vec<String> = mailboxes.iter().map(topic_for).collect();
         let packet_id = next_packet_id();
-        socket
-            .send(Message::Binary(build_subscribe(packet_id, &topics).into()))
-            .await
-            .map_err(Error::Ws)?;
+        conn.send_packet(build_subscribe(packet_id, &topics))
+            .await?;
         // Wait for the SUBACK, silently absorbing anything else.
         loop {
-            let packet = next_packet(&mut socket).await?;
+            let packet = next_packet(&mut conn).await?;
             if packet_opcode(&packet) == OP_SUBACK {
                 break;
             }
         }
-        Ok(subscription_stream(socket))
+        Ok(subscription_stream(conn))
     }
 }
 
@@ -213,20 +367,18 @@ fn next_packet_id() -> u16 {
     if id == 0 { 1 } else { id }
 }
 
-fn subscription_stream(socket: Socket) -> EventStream {
-    Box::pin(futures_util::stream::unfold(socket, |mut socket| async move {
+fn subscription_stream(conn: Conn) -> EventStream {
+    Box::pin(futures_util::stream::unfold(conn, |mut conn| async move {
         loop {
-            let message = tokio::select! {
-                message = socket.next() => message,
+            let received = tokio::select! {
+                received = conn.recv_packet() => received,
                 _ = tokio::time::sleep(PING_INTERVAL) => {
-                    let _ = socket
-                        .send(Message::Binary(build_pingreq().into()))
-                        .await;
+                    let _ = conn.send_packet(build_pingreq()).await;
                     continue;
                 }
             };
-            match message {
-                Some(Ok(Message::Binary(data))) => {
+            match received {
+                Ok(Some(data)) => {
                     if packet_opcode(&data) != OP_PUBLISH {
                         continue;
                     }
@@ -235,9 +387,7 @@ fn subscription_stream(socket: Socket) -> EventStream {
                     };
                     if qos > 0 {
                         if let Some(packet_id) = packet_id {
-                            let _ = socket
-                                .send(Message::Binary(build_puback(packet_id).into()))
-                                .await;
+                            let _ = conn.send_packet(build_puback(packet_id)).await;
                         }
                     }
                     let Some(mailbox) = mailbox_from_topic(&topic) else {
@@ -245,37 +395,32 @@ fn subscription_stream(socket: Socket) -> EventStream {
                     };
                     match serde_json::from_slice::<RelayEvent>(&payload) {
                         Ok(event) if event.mailbox == mailbox => {
-                            return Some((Ok(event), socket));
+                            return Some((Ok(event), conn));
                         }
                         Ok(_) => continue,
-                        Err(error) => return Some((Err(Error::Json(error)), socket)),
+                        Err(error) => return Some((Err(Error::Json(error)), conn)),
                     }
                 }
-                Some(Ok(Message::Close(_))) | None => return None,
-                Some(Ok(_)) => continue,
-                Some(Err(error)) => return Some((Err(Error::Ws(error)), socket)),
+                Ok(None) => return None,
+                Err(error) => return Some((Err(error), conn)),
             }
         }
     }))
 }
 
-async fn next_packet(socket: &mut Socket) -> Result<Vec<u8>> {
-    loop {
-        let message = tokio::time::timeout(OP_TIMEOUT, socket.next())
-            .await
-            .map_err(|_| Error::Timeout)?;
-        match message {
-            Some(Ok(Message::Binary(data))) => return Ok(data.to_vec()),
-            Some(Ok(Message::Close(_))) | None => return Err(Error::Closed),
-            Some(Ok(_)) => continue,
-            Some(Err(error)) => return Err(Error::Ws(error)),
-        }
+async fn next_packet(conn: &mut Conn) -> Result<Vec<u8>> {
+    let received = tokio::time::timeout(OP_TIMEOUT, conn.recv_packet())
+        .await
+        .map_err(|_| Error::Timeout)?;
+    match received? {
+        Some(packet) => Ok(packet),
+        None => Err(Error::Closed),
     }
 }
 
-async fn wait_connack(socket: &mut Socket) -> Result<()> {
+async fn wait_connack(conn: &mut Conn) -> Result<()> {
     loop {
-        let packet = next_packet(socket).await?;
+        let packet = next_packet(conn).await?;
         if packet_opcode(&packet) != OP_CONNACK {
             continue;
         }
@@ -528,6 +673,14 @@ mod tests {
 
         let client = MqttClient::from_url("ftp://broker.example").unwrap();
         assert!(client.ws_url().is_err());
+    }
+
+    #[test]
+    fn native_tls_scheme_detection() {
+        let client = MqttClient::from_url("mqtttls://broker.example:8883").unwrap();
+        assert!(client.is_native_tls());
+        let client = MqttClient::from_url("mqtts://broker.example:8884/mqtt").unwrap();
+        assert!(!client.is_native_tls());
     }
 
     #[test]
