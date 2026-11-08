@@ -2,8 +2,8 @@
 
 Обновлено: 2026-11-08
 Ветка: `main`
-Статус: P4 в работе (доставка, reconnect, ротация prekey, пул и манифест готовы)
-Тестов: 81
+Статус: P4 в работе (доставка, reconnect, ротация prekey, пул, манифест и MQTT готовы; остался только деплой публичного релея)
+Тестов: 88
 
 > Этот файл — точка входа для ИИ-агентов. Прочитай его и `SPEC.md`
 > перед любыми изменениями. После каждого завершённого этапа обновляй
@@ -33,7 +33,7 @@
 | P1: `oc-core` — крипто и протокол | готово, 33 теста |
 | P2: `oc-wire`, `oc-transport`, `oc-relay` | готово, 18 тестов |
 | P3: `oc-client` + CLI (invite → handshake → текст) | готово, 19 тестов |
-| P4: reconnect, outbox, prekey rotation, default pool, MQTT | **почти готово**: остались публичный релей и MQTT |
+| P4: reconnect, outbox, prekey rotation, default pool, MQTT | **почти готово**: остался только деплой публичного релея |
 | P5: desktop UI (Linux gnu/musl, Windows) | не начато |
 | P6: Tor, cover traffic, аудит, mobile | не начато |
 
@@ -85,6 +85,12 @@ openchat/
 ### `oc-transport`
 - `Carrier` trait: `health`, `publish`, `subscribe`, `subscribe_many`.
 - `RelayClient` — WebSocket, TLS через rustls + ring.
+- `MqttClient` — MQTT 3.1.1 поверх WSS (без новых зависимостей):
+  топик `openchat/v1/<mailbox hex>`, пейлоад — тот же JSON `RelayEvent`,
+  QoS 1, retained/will нет. Эндпоинт `mqtts://…` (путь по умолчанию
+  `/mqtt`); `RelayPool::add_url` выбирает носитель по схеме, в пуле
+  носители смешиваются. `since` не поддерживается (live-only) — офлайн
+  покрывает outbox клиента.
 - `RelayPool` — fan-out, fallback, `subscribe_all_many` (merge всех релеев).
   Каждый поток в reconnect-loop (250 ms … 30 s). Две последовательные
   ошибки временно исключают релей из fan-out; health-check сбрасывает.
@@ -175,7 +181,7 @@ cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Ожидаемо: 81 тест. Ручная проверка релея:
+Ожидаемо: 88 тестов. Ручная проверка релея:
 
 ```bash
 cargo run -p oc-relay -- --listen 127.0.0.1:8080
@@ -216,6 +222,8 @@ curl http://127.0.0.1:8080/health
 12. `relays/default.json` пуст — без `--relay` клиент не заработает.
 13. На релее нет rate limiting / anti-DoS; только лимиты на ящик и payload.
 14. Нет event id: `since` работает по `created_at`, возможны дубли.
+    MQTT-носитель — live-only: брокер не хранит историю, `since`
+    игнорируется, офлайн-доставка только через outbox и WS-релеи.
 15. Нет cover traffic и рандомизации задержек на уровне клиента.
 16. Подписка на 64+ ящиков на контакт масштабируется линейно; лимит 4096
     на соединение.
@@ -262,7 +270,12 @@ curl http://127.0.0.1:8080/health
 4. **Пул релеев**
    - Развернуть публичный релей, заполнить `relays/default.json`.
    - Подписанный манифест, health-check, исключение мёртвых.
-5. **MQTT-носитель** (WSS) как второй `Carrier`.
+5. **MQTT-носитель** (WSS) как второй `Carrier` — готово
+   - `MqttClient` в `oc-transport`: MQTT 3.1.1 поверх WSS без новых
+     зависимостей, топик `openchat/v1/<mailbox>`, QoS 1, пейлоад —
+     JSON `RelayEvent`. `mqtts://` в `RelayPool::add_url` выбирает
+     MQTT-носитель, пул смешивает носители.
+   - Live-only: `since` не поддерживается, офлайн покрывает outbox.
 6. **Тесты**: offline → online, несколько релеев, потеря соединения,
    повторная доставка, ротация prekey.
 

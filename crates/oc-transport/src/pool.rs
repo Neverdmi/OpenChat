@@ -10,7 +10,7 @@ use oc_core::random_array;
 use oc_wire::RelayEvent;
 use url::Url;
 
-use crate::{Carrier, Error, EventStream, RelayClient, Result};
+use crate::{Carrier, Error, EventStream, MqttClient, RelayClient, Result};
 
 /// Delay before the first reconnect attempt.
 const RECONNECT_INITIAL: Duration = Duration::from_millis(250);
@@ -70,9 +70,17 @@ impl RelayPool {
     }
 
     /// Add a relay by URL.
+    ///
+    /// `mqtts://`/`mqtt://` endpoints become an MQTT-over-WSS carrier
+    /// ([`MqttClient`]); everything else is a WebSocket relay
+    /// ([`RelayClient`]). Both are interchangeable in the pool, so one
+    /// [`RelayPool`] can mix carriers.
     pub fn add_url(&mut self, url: &str) -> Result<()> {
-        let client = RelayClient::from_url(url)?;
-        self.add(Arc::new(client));
+        let parsed = Url::parse(url).map_err(|error| Error::Url(error.to_string()))?;
+        match parsed.scheme() {
+            "mqtts" | "mqtt" => self.add(Arc::new(MqttClient::new(parsed))),
+            _ => self.add(Arc::new(RelayClient::new(parsed))),
+        }
         Ok(())
     }
 
@@ -488,5 +496,19 @@ mod tests {
         pool.add_url("https://relay.example").unwrap();
         assert_eq!(pool.len(), 1);
         assert!(pool.add_url("not a url").is_err());
+    }
+
+    #[test]
+    fn mqtt_urls_dispatch_to_mqtt_carrier() {
+        let mut pool = RelayPool::new();
+        pool.add_url("mqtts://broker.example/mqtt").unwrap();
+        pool.add_url("mqtt://broker.example:1883/mqtt").unwrap();
+        assert_eq!(pool.len(), 2);
+        let schemes: Vec<&str> = pool
+            .endpoints()
+            .iter()
+            .map(|url| url.scheme())
+            .collect();
+        assert_eq!(schemes, vec!["mqtts", "mqtt"]);
     }
 }

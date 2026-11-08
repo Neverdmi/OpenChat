@@ -8,6 +8,7 @@
 
 pub mod client;
 pub mod error;
+pub mod mqtt;
 pub mod pool;
 pub mod relay_list;
 
@@ -20,6 +21,7 @@ use url::Url;
 
 pub use client::RelayClient;
 pub use error::{Error, Result};
+pub use mqtt::MqttClient;
 pub use pool::RelayPool;
 
 /// Stream of events delivered by a carrier.

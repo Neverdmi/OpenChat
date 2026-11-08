@@ -248,6 +248,25 @@ kind=2  text:      payload = header(40) || ratchet_ciphertext
 | 5 | XMPP / Matrix (WSS) | третья экосистема |
 | 6 | Tor (`arti`) | `fallback` или `always`; `.onion`-релеи |
 
+### 9.4 MQTT-носитель (WSS)
+
+Второй носитель для обхода блокировок по протоколу/домену (реализован в
+`oc-transport` как `MqttClient`, MQTT 3.1.1 поверх WebSocket):
+
+- Эндпоинт задаётся схемой `mqtts://` (или `mqtt://`), транслируется в
+  `wss://` (или `ws://`); путь — WebSocket-путь брокера, по умолчанию
+  `/mqtt`. Опционально — `user:pass@` из URL. Брокеры только с нативным
+  TLS TCP (8883) не поддерживаются.
+- Один ящик = топик `openchat/v1/<mailbox_hex>`. Один `RelayEvent` =
+  один `PUBLISH` с тем же JSON-пейлоадом, что и у WebSocket-релея.
+- QoS 1 в обе стороны; дубли гасятся дедупом по `msg_id` (как при
+  нескольких релеях). Retained-сообщений, will и persistent session нет —
+  после закрытия соединения брокер ничего не хранит.
+- `since` не поддерживается: публичные брокеры не ведут анонимного
+  журнала пересылки на ящик, поэтому MQTT — только live-доставка, а
+  офлайн-отправку обеспечивает outbox клиента. Публикацию можно делать
+  только на брокер, где разрешён анонимный доступ и топики такого вида.
+
 ### 9.2 Политика выбора
 - Отправка: 3–5 случайных релеев из активного пула, успех при ≥1.
 - Health-check: latency, uptime, TLS-ошибки; мёртвые/заблокированные временно исключаются.
@@ -386,7 +405,7 @@ magic(8) || salt(16) || nonce(24) || XChaCha20-Poly1305(JSON state)
 | P1 | `oc-core`: identity, PQ, X3DH, sealed sender, кадры, ящики, ratchet + тесты | готово (25 тестов) |
 | P2 | `oc-transport`: Carrier trait, WebSocket-релей, пул, health-check | готово (41 тест суммарно) |
 | P3 | `oc-client` + CLI: invite → handshake → текст 1:1, offline-доставка | готово (70 тестов суммарно) |
-| P4 | `oc-relay`, default pool, manifest, MQTT/WebRTC-фолбэки | — |
+| P4 | `oc-relay`, default pool, manifest, MQTT/WebRTC-фолбэки | частично: MQTT готов; публичный релей ждёт деплоя, WebRTC — позже |
 | P5 | Desktop UI (Linux gnu/musl + Windows), упаковка | — |
 | P6 | Tor-режимы, cover-трафик, аудит, mobile | — |
 

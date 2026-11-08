@@ -1,6 +1,6 @@
 [package]
 name = "oc-transport"
-description = "OpenChat relay transport: carrier trait, WebSocket client, relay pool"
+description = "OpenChat relay transport: carrier trait, WebSocket and MQTT clients, relay pool"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
