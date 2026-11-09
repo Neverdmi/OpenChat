@@ -2,7 +2,7 @@
 
 Обновлено: 2026-11-09
 Ветка: `main`
-Версия: 0.1.25 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.26)
+Версия: 0.1.26 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.27)
 Статус: P4 почти готов (свой релей не развёрнут; default.json заполнен публичными MQTT-брокерами); P5 — CLI и TUI готовы (GUI удалён), осталась упаковка
 Тестов: 100 (+17 oc-tui, вне default-members)
 
@@ -123,8 +123,11 @@ openchat/
   совместимости (`invite_full()`, `oc invite --full`). Встроенные
   дефолтные релеи в hints не кладутся.
 - Bundle публикуется в `listen_once` (троттлинг 5 мин/сессия) на
-  bundle-mailbox `HKDF(peer_id, "openchat/bundle-mailbox/v1")`;
-  `add_invite` с коротким invite забирает и верифицирует bundle.
+  bundle-mailbox `HKDF(peer_id, "openchat/bundle-mailbox/v1")` +
+  по запросу (`bundle_request` → немедленная публикация);
+  `add_invite` с коротким invite шлёт запрос, забирает и верифицирует
+  bundle. Ошибка fetch — отдельная `Error::BundleFetch` с подсказкой
+  про онлайн/полный invite.
 - `message.rs` — text body (`msg_id`, timestamp, UTF-8) и inner envelope
   (`kind=1` handshake, `kind=2` ratchet text).
 - `client.rs` — `Client::{create,open,invite,add_invite,send_text,listen_once,

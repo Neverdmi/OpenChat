@@ -104,6 +104,9 @@ enum MailboxRef {
         peer_id: [u8; 32],
         secret: [u8; 32],
     },
+    Bundle {
+        secret: [u8; 32],
+    },
 }
 
 type SubscriptionMap = HashMap<[u8; 32], MailboxRef>;
@@ -128,6 +131,8 @@ pub struct Client {
     store: StateStore,
     /// Last bundle publish (UNIX seconds, session-only throttle).
     last_bundle_publish: u64,
+    /// A bundle request arrived; publish the bundle on the next pass.
+    bundle_requested: bool,
     /// Whether WebRTC direct delivery is attempted (opt-in).
     webrtc_enabled: bool,
     /// Live WebRTC sessions by peer id (session-only, never persisted).
@@ -152,6 +157,7 @@ impl Client {
             state,
             store,
             last_bundle_publish: 0,
+            bundle_requested: false,
             webrtc_enabled: false,
             webrtc_sessions: HashMap::new(),
         })
@@ -167,6 +173,7 @@ impl Client {
             state,
             store,
             last_bundle_publish: 0,
+            bundle_requested: false,
             webrtc_enabled: false,
             webrtc_sessions: HashMap::new(),
         })
@@ -272,7 +279,10 @@ impl Client {
         let invite = Invite::decode(invite_text)?;
         let bundle = match invite.bundle.clone() {
             Some(bundle) => bundle,
-            None => fetch_bundle(pool, &invite.peer_id).await?,
+            None => {
+                let own = self.state.peer_id()?;
+                fetch_bundle(pool, &own, &invite.peer_id).await?
+            }
         };
         let me = self.state.identity()?;
         let my_public = me.public();
@@ -639,6 +649,10 @@ impl Client {
         since: u64,
     ) -> Result<ListenOutcome> {
         let _ = self.flush_due_outbox(pool, DEFAULT_FANOUT).await?;
+        if self.bundle_requested {
+            self.bundle_requested = false;
+            self.last_bundle_publish = 0;
+        }
         let _ = self.publish_bundle(pool).await;
         let mut outcome = ListenOutcome::default();
         let mut pending_acks: Vec<([u8; 32], [u8; 16])> = Vec::new();
@@ -855,6 +869,15 @@ impl Client {
             );
         }
 
+        // Our own bundle mailbox: bundle requests from peers following
+        // short invites land here.
+        map.insert(
+            mailbox::bundle_mailbox_public(&me),
+            MailboxRef::Bundle {
+                secret: mailbox::bundle_mailbox_secret(&me),
+            },
+        );
+
         // Replay only what may have been produced after a mailbox or session
         // existed, then from the newest cursor for mailboxes already seen.
         // Using the minimum across mailboxes is required because the relay's
@@ -863,6 +886,7 @@ impl Client {
         for (mailbox, reference) in &map {
             let floor = match reference {
                 MailboxRef::Handshake { created_at, .. } => *created_at,
+                MailboxRef::Bundle { .. } => 0,
                 MailboxRef::Signaling { peer_id, .. } => self
                     .state
                     .contact(peer_id)
@@ -907,8 +931,20 @@ impl Client {
             Some(MailboxRef::Signaling { peer_id, secret }) => {
                 self.process_signaling(&peer_id, &secret, &event.payload).await
             }
+            Some(MailboxRef::Bundle { secret }) => {
+                self.process_bundle_request(&secret, &event.payload)
+            }
             None => Ok(Processed::Ignored),
         }
+    }
+
+    /// Handle a bundle request sealed to our bundle mailbox: flag a
+    /// bundle publish for the next listen pass (on-demand fetch).
+    fn process_bundle_request(&mut self, secret: &[u8; 32], payload: &[u8]) -> Result<Processed> {
+        if seal::open(secret, payload).is_ok() {
+            self.bundle_requested = true;
+        }
+        Ok(Processed::Ignored)
     }
 
     /// Handle one WebRTC signaling payload sealed to our signaling mailbox.
@@ -1127,16 +1163,33 @@ fn invite_hints(relays: &[String]) -> Vec<String> {
 /// different bundle without the identity private key.
 async fn fetch_bundle(
     pool: &RelayPool,
+    own_peer_id: &[u8; 32],
     peer_id: &[u8; 32],
 ) -> Result<oc_core::x3dh::PrekeyBundle> {
     let mailbox = mailbox::bundle_mailbox_public(peer_id);
     let secret = mailbox::bundle_mailbox_secret(peer_id);
+    // Ask the owner to publish the bundle right now (live carriers
+    // keep nothing, so a periodic publish alone rarely overlaps the
+    // fetch window).
+    let request = serde_json::json!({"type": "bundle_request", "from": own_peer_id});
+    if let Ok(plaintext) = serde_json::to_vec(&request) {
+        if let Ok(payload) = seal::seal(&mailbox, &plaintext) {
+            let now = now_unix();
+            let event = RelayEvent {
+                mailbox,
+                created_at: now,
+                expires_at: now.saturating_add(MESSAGE_TTL_SECONDS),
+                payload,
+            };
+            let _ = pool.publish(&event, DEFAULT_FANOUT).await;
+        }
+    }
     let mut stream = pool.subscribe_all_many(&[mailbox], 0).await?;
     let deadline = tokio::time::Instant::now() + BUNDLE_FETCH_TIMEOUT;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(Error::Invite);
+            return Err(Error::BundleFetch);
         }
         match tokio::time::timeout(remaining, stream.next()).await {
             Ok(Some(Ok(event))) if event.mailbox == mailbox => {
@@ -1151,8 +1204,8 @@ async fn fetch_bundle(
                 }
             }
             Ok(Some(Ok(_))) => continue,
-            Ok(Some(Err(_))) | Ok(None) => return Err(Error::Invite),
-            Err(_) => return Err(Error::Invite),
+            Ok(Some(Err(_))) | Ok(None) => return Err(Error::BundleFetch),
+            Err(_) => return Err(Error::BundleFetch),
         }
     }
 }

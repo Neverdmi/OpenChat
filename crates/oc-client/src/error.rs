@@ -28,6 +28,13 @@ pub enum Error {
     #[error("invalid invite link")]
     Invite,
 
+    /// The bundle for a short invite could not be fetched from the
+    /// relays (peer offline or unreachable).
+    #[error(
+        "could not fetch the contact's bundle from the relays: the peer has to be online (app open, listening) right now, or share a full invite instead (oc invite --full)"
+    )]
+    BundleFetch,
+
     /// State is missing, corrupted or from an unsupported version.
     #[error("invalid state: {0}")]
     State(String),
