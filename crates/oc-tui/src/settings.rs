@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// User settings for the TUI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Settings {
+pub(crate) struct Settings {
     /// Tor routing mode.
     #[serde(default)]
     pub tor_mode: TorModeSetting,
@@ -50,7 +50,7 @@ fn default_fanout() -> usize {
 /// Serde-friendly spelling of [`TorMode`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum TorModeSetting {
+pub(crate) enum TorModeSetting {
     /// Direct connections, Tor unused.
     #[default]
     Off,
@@ -62,7 +62,7 @@ pub enum TorModeSetting {
 
 impl TorModeSetting {
     /// Convert to the transport-layer mode.
-    pub fn to_mode(self) -> TorMode {
+    pub(crate) fn to_mode(self) -> TorMode {
         match self {
             Self::Off => TorMode::Off,
             Self::Fallback => TorMode::Fallback,
@@ -71,7 +71,7 @@ impl TorModeSetting {
     }
 
     /// Cycle to the next mode (for the settings menu).
-    pub fn next(&self) -> Self {
+    pub(crate) fn next(&self) -> Self {
         match self {
             Self::Off => Self::Fallback,
             Self::Fallback => Self::Always,
@@ -80,7 +80,7 @@ impl TorModeSetting {
     }
 
     /// Cycle to the previous mode (for the settings menu).
-    pub fn prev(&self) -> Self {
+    pub(crate) fn prev(&self) -> Self {
         match self {
             Self::Off => Self::Always,
             Self::Fallback => Self::Off,
@@ -90,21 +90,40 @@ impl TorModeSetting {
 }
 
 /// Path of the settings file inside a state directory.
-pub fn path_in(home: &Path) -> PathBuf {
+pub(crate) fn path_in(home: &Path) -> PathBuf {
     home.join("settings.json")
 }
 
-/// Load settings, falling back to defaults when absent or invalid.
-pub fn load(home: &Path) -> Settings {
-    let text = std::fs::read_to_string(path_in(home)).unwrap_or_default();
-    serde_json::from_str(&text).unwrap_or_default()
+/// Load settings. A missing file yields defaults; a corrupt file is a
+/// hard error instead of a silent downgrade to Tor Off (audit M-U1).
+pub(crate) fn load(home: &Path) -> Result<Settings, String> {
+    let path = path_in(home);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Settings::default());
+        }
+        Err(error) => return Err(format!("read settings: {error}")),
+    };
+    let mut settings: Settings = serde_json::from_str(&text)
+        .map_err(|error| format!("settings.json is corrupt ({error}); fix or delete it"))?;
+    settings.fanout = settings.fanout.clamp(1, 5);
+    Ok(settings)
 }
 
-/// Persist settings (best effort; failures are reported by the caller).
-pub fn save(home: &Path, settings: &Settings) -> std::io::Result<()> {
+/// Persist settings atomically with private permissions (audit M-U1).
+pub(crate) fn save(home: &Path, settings: &Settings) -> std::io::Result<()> {
     let text = serde_json::to_string_pretty(settings)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    std::fs::write(path_in(home), text)
+    let path = path_in(home);
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, &text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&temp, &path)
 }
 
 #[cfg(test)]
@@ -133,7 +152,7 @@ mod tests {
 
     #[test]
     fn load_missing_file_gives_defaults() {
-        let settings = load(Path::new("/tmp/oc-tui-definitely-missing-home"));
+        let settings = load(Path::new("/tmp/oc-tui-definitely-missing-home")).unwrap();
         assert_eq!(settings.fanout, 3);
     }
 
@@ -152,7 +171,7 @@ mod tests {
             webrtc: true,
         };
         save(&dir, &settings).unwrap();
-        let loaded = load(&dir);
+        let loaded = load(&dir).unwrap();
         assert_eq!(loaded.tor_mode, TorModeSetting::Always);
         assert_eq!(loaded.fanout, 5);
         assert!(loaded.show_invite_on_start);

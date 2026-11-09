@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `oc` — OpenChat command-line client.
 
 use std::path::{Path, PathBuf};
@@ -147,8 +149,21 @@ pub fn run_cli_from(args: Vec<std::ffi::OsString>) -> Result<()> {
     runtime.block_on(run_inner(args))
 }
 
+/// Fan-out is clamped to the same 1–5 range as the TUI settings (M-U5).
+fn check_fanout(fanout: usize) -> Result<()> {
+    if !(1..=5).contains(&fanout) {
+        bail!("--fanout must be between 1 and 5");
+    }
+    Ok(())
+}
+
 async fn run_inner(argv: Vec<std::ffi::OsString>) -> Result<()> {
     let args = Args::try_parse_from(argv).unwrap_or_else(|error| error.exit());
+    // State directory must be absolute so a stray relative path cannot
+    // scatter encrypted state into the working directory (audit M-U6).
+    if !args.home.is_absolute() {
+        bail!("--home must be an absolute path");
+    }
 
     match args.command {
         Command::Init { relays } => init(&args.home, relays),
@@ -166,10 +181,19 @@ async fn run_inner(argv: Vec<std::ffi::OsString>) -> Result<()> {
             invite: link,
             fanout,
         } => {
+            check_fanout(fanout)?;
             let passphrase = passphrase(false)?;
             let mut client = open_client(&args.home, &passphrase)?;
 
             let invite = Invite::decode(&link).context("invalid invite link")?;
+            if !invite.relays.is_empty() {
+                // Relay hints carry sender-chosen endpoints: make the
+                // merge visible instead of silent (audit M-L2).
+                eprintln!(
+                    "note: invite carries {} relay hint(s); they will be added to your relays",
+                    invite.relays.len()
+                );
+            }
             let mut relays = client.relays().to_vec();
             for relay in &invite.relays {
                 if !relays.contains(relay) {
@@ -189,6 +213,7 @@ async fn run_inner(argv: Vec<std::ffi::OsString>) -> Result<()> {
             Ok(())
         }
         Command::Send { peer, text, fanout } => {
+            check_fanout(fanout)?;
             let passphrase = passphrase(false)?;
             let mut client = open_client(&args.home, &passphrase)?;
             let peer_id = resolve_peer(&client, &peer)?;
@@ -212,6 +237,7 @@ async fn run_inner(argv: Vec<std::ffi::OsString>) -> Result<()> {
             fanout,
             webrtc,
         } => {
+            check_fanout(fanout)?;
             let passphrase = passphrase(false)?;
             let mut client = open_client(&args.home, &passphrase)?;
             client.set_webrtc(webrtc);
@@ -235,6 +261,7 @@ async fn run_inner(argv: Vec<std::ffi::OsString>) -> Result<()> {
             Ok(())
         }
         Command::Flush { fanout } => {
+            check_fanout(fanout)?;
             let passphrase = passphrase(false)?;
             let mut client = open_client(&args.home, &passphrase)?;
             let pool = build_pool(client.relays())?;
@@ -435,13 +462,33 @@ async fn run_chat(
     Ok(())
 }
 
+/// Strip control characters (including ESC, bidi overrides) from
+/// peer-supplied text before printing it to a terminal (audit M-U2).
+/// Newlines and tabs are flattened to spaces so one message cannot
+/// forge extra screen lines.
+pub fn sanitize_terminal_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_control() {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
 /// Print everything one receive pass produced.
 fn print_outcome(outcome: &ListenOutcome) {
     for peer_id in &outcome.added_contacts {
         println!("new contact: {}", short_peer_id(peer_id));
     }
     for message in &outcome.messages {
-        println!("{}: {}", short_peer_id(&message.peer_id), message.text);
+        println!(
+            "{}: {}",
+            short_peer_id(&message.peer_id),
+            sanitize_terminal_text(&message.text)
+        );
     }
     for ack in &outcome.acks {
         println!(
@@ -517,16 +564,11 @@ fn resolve_peer(client: &Client, argument: &str) -> Result<[u8; 32]> {
 
 fn passphrase(confirm: bool) -> Result<Zeroizing<String>> {
     if let Ok(value) = std::env::var("OPENCHAT_PASSPHRASE") {
-        // Same policy as the interactive path (audit H18), and scrub
-        // the variable from the environment so child processes and
-        // `/proc/*/environ` do not keep the passphrase around.
+        // Same length policy as the interactive path (audit H18).
+        // The variable stays in the environment (removing it would
+        // need an `unsafe` block, forbidden in this crate).
         if value.len() < 8 {
             bail!("OPENCHAT_PASSPHRASE must be at least 8 characters");
-        }
-        // SAFETY: this runs single-threaded at startup, before any
-        // worker threads or child processes exist.
-        unsafe {
-            std::env::remove_var("OPENCHAT_PASSPHRASE");
         }
         return Ok(Zeroizing::new(value));
     }
@@ -544,7 +586,8 @@ fn passphrase(confirm: bool) -> Result<Zeroizing<String>> {
     Ok(first)
 }
 
-fn format_safety(bytes: &[u8; 32]) -> String {
+/// Format a safety number as hex chunks (shared with the TUI).
+pub fn format_safety(bytes: &[u8; 32]) -> String {
     bytes
         .chunks(4)
         .map(hex::encode)
@@ -552,7 +595,8 @@ fn format_safety(bytes: &[u8; 32]) -> String {
         .join(" ")
 }
 
-fn default_home() -> PathBuf {
+/// Default state directory (`~/.openchat`), shared with the TUI.
+pub fn default_home() -> PathBuf {
     if let Some(home) = std::env::var_os("OPENCHAT_HOME") {
         return PathBuf::from(home);
     }

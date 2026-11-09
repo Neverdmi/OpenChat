@@ -40,10 +40,6 @@ pub enum Error {
     #[error("key derivation failed")]
     Kdf,
 
-    /// Post-quantum KEM operation failed.
-    #[error("post-quantum KEM error: {0}")]
-    Pq(String),
-
     /// Operating system RNG failed.
     #[error("randomness source failed")]
     Rng,

@@ -128,9 +128,9 @@ windows-таргет на Windows или с mingw-кроссом.
 Тесты и проверки:
 
 ```bash
-cargo test
+cargo test                 # default-members (oc-tui не входит сюда)
+cargo test -p oc-tui       # TUI: 17 тестов
 cargo clippy --all-targets
-cargo test -p oc-tui
 ```
 
 ## Быстрый старт (два терминала)
@@ -198,7 +198,7 @@ OPENCHAT_PASSPHRASE='alice-passphrase' ./target/debug/oc --home /tmp/alice chat 
 
 Первый запуск: на экране входа нажми **F2** (режим Create), введи каталог
 состояния, пароль — или **F3**, чтобы сгенерировать сильный
-(`word-word-word-word-1234`; запиши его, восстановить нельзя), повтори
+(`word-word-word-word-word-1234`; запиши его, восстановить нельзя), повтори
 пароль, Enter. Дальше всё внутри:
 
 - контакты слева (Tab, ↑↓), переписка по центру, ввод снизу;

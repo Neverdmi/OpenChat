@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `oc-tui` — OpenChat terminal UI (ratatui).
 //!
 //! Run without arguments for the TUI. Pass `--cli` anywhere before the
@@ -25,9 +27,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 
-/// Whether the given argv requests CLI mode (`--cli` present).
+/// Whether the given argv requests CLI mode (`--cli` as first argument,
+/// audit M-U11 — a `--cli` later in argv is a different flag).
 fn is_cli_mode(argv: &[OsString]) -> bool {
-    argv.iter().any(|arg| arg == "--cli")
+    argv.get(1).is_some_and(|arg| arg == "--cli")
 }
 
 /// State directory for the `--cli` Tor check: `--home` from argv,
@@ -74,7 +77,13 @@ fn main() {
         // configured Tor mode would leak the real IP (audit C7).
         // Refuse instead of downgrading.
         let home = home_from_argv(&argv);
-        let settings = settings::load(&home);
+        let settings = match settings::load(&home) {
+            Ok(settings) => settings,
+            Err(message) => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+        };
         if settings.tor_mode != settings::TorModeSetting::Off {
             eprintln!(
                 "error: tor_mode is {:?} in {} — CLI mode has no Tor support and would leak your IP; use the TUI or set tor_mode to off",
@@ -105,6 +114,15 @@ fn run_tui() -> anyhow::Result<()> {
 
     let result = event_loop(&mut terminal);
 
+    // Clear the clipboard selection we may have set via OSC 52 (M-U3).
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        let _ = execute!(
+            terminal.backend_mut(),
+            crossterm::style::Print("\x1b]52;c;\x1b\\")
+        );
+    }
+
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -120,16 +138,22 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::
 
         // Clipboard copy via OSC 52 (works in most modern terminals and
         // avoids error-prone mouse selection of the long invite text).
+        // Only emitted on a real TTY (audit M-U3).
         if app.copy_requested {
             app.copy_requested = false;
             use base64::Engine;
-            let encoded =
-                base64::engine::general_purpose::STANDARD.encode(app.invite.as_bytes());
-            execute!(
-                terminal.backend_mut(),
-                crossterm::style::Print(format!("\x1b]52;c;{encoded}\x07"))
-            )?;
-            app.status = "invite copied to clipboard".to_string();
+            use std::io::IsTerminal;
+            if std::io::stdout().is_terminal() {
+                let encoded =
+                    base64::engine::general_purpose::STANDARD.encode(app.invite.as_bytes());
+                execute!(
+                    terminal.backend_mut(),
+                    crossterm::style::Print(format!("\x1b]52;c;{encoded}\x07"))
+                )?;
+                app.status = "invite copied to clipboard".to_string();
+            } else {
+                app.status = "clipboard unavailable (not a terminal)".to_string();
+            }
         }
 
         if app.should_quit {
@@ -204,9 +228,22 @@ fn handle_key(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) {
                 }
             },
             KeyCode::Char(ch) => match app.lock_field {
-                app::LockField::Home => app.home.push(ch),
-                app::LockField::Passphrase => app.passphrase.push(ch),
-                app::LockField::Confirm => app.confirm_passphrase.push(ch),
+                // Cap field lengths (audit L18: unbounded paste).
+                app::LockField::Home => {
+                    if app.home.chars().count() < 256 {
+                        app.home.push(ch)
+                    }
+                }
+                app::LockField::Passphrase => {
+                    if app.passphrase.chars().count() < 256 {
+                        app.passphrase.push(ch)
+                    }
+                }
+                app::LockField::Confirm => {
+                    if app.confirm_passphrase.chars().count() < 256 {
+                        app.confirm_passphrase.push(ch)
+                    }
+                }
             },
             _ => {}
         }
@@ -251,7 +288,11 @@ fn handle_key(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) {
                 app.input.pop();
             }
             KeyCode::Tab => app.focus = Focus::Contacts,
-            KeyCode::Char(ch) => app.input.push(ch),
+            KeyCode::Char(ch) => {
+                if app.input.chars().count() < 4096 {
+                    app.input.push(ch)
+                }
+            }
             _ => {}
         },
         Focus::Contacts => match code {
@@ -402,7 +443,10 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TuiApp) {
             Line::from(""),
             Line::from(app.invite.clone()),
             Line::from(""),
-            Line::from("C copy to clipboard · Esc to close"),
+            Line::from("Full invite (bundle embedded, works offline):"),
+            Line::from(app.invite_full.clone()),
+            Line::from(""),
+            Line::from("C copy short link to clipboard · Esc to close"),
         ];
         let panel = Paragraph::new(invite_text)
             .wrap(ratatui::widgets::Wrap { trim: false })
@@ -519,7 +563,8 @@ fn draw_unlock(frame: &mut ratatui::Frame, app: &TuiApp) {
     } else {
         Style::default()
     };
-    let masked = "*".repeat(app.passphrase.chars().count());
+    // Fixed dot count: the repeat count itself leaks the length (L18).
+    let masked = "*".repeat(app.passphrase.chars().count().min(16));
     let pass_title = if creating {
         "Passphrase (F3 generate, Tab next)"
     } else {

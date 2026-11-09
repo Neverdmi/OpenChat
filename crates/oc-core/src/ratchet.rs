@@ -106,6 +106,9 @@ fn kdf_root(root_key: &[u8; 32], dh_output: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     (root, chain)
 }
 
+/// How long skipped keys are retained (SPEC §5: bounded count + TTL).
+pub const SKIPPED_TTL_SECONDS: u64 = 7 * 86_400;
+
 /// One skipped message key, exported for encrypted state persistence.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SkippedKey {
@@ -115,6 +118,9 @@ pub struct SkippedKey {
     pub n: u32,
     /// Derived message key.
     pub key: [u8; 32],
+    /// UNIX seconds when the key was skipped (for TTL eviction).
+    #[serde(default)]
+    pub at: u64,
 }
 
 impl Drop for SkippedKey {
@@ -196,7 +202,7 @@ struct StateBackup {
     send_count: u32,
     prev_send_count: u32,
     recv_count: u32,
-    skipped: BTreeMap<([u8; 32], u32), [u8; 32]>,
+    skipped: BTreeMap<([u8; 32], u32), ([u8; 32], u64)>,
 }
 
 /// Per-session Double Ratchet state.
@@ -210,7 +216,7 @@ pub struct Ratchet {
     send_count: u32,
     prev_send_count: u32,
     recv_count: u32,
-    skipped: BTreeMap<([u8; 32], u32), [u8; 32]>,
+    skipped: BTreeMap<([u8; 32], u32), ([u8; 32], u64)>,
     transcript: Vec<u8>,
     max_skip: u32,
 }
@@ -301,10 +307,11 @@ impl Ratchet {
             skipped: self
                 .skipped
                 .iter()
-                .map(|((dh, n), key)| SkippedKey {
+                .map(|((dh, n), (key, at))| SkippedKey {
                     dh: *dh,
                     n: *n,
                     key: *key,
+                    at: *at,
                 })
                 .collect(),
             transcript: self.transcript.clone(),
@@ -318,6 +325,9 @@ impl Ratchet {
     /// zeroize it afterwards, audit H2).
     pub fn from_snapshot(snapshot: &RatchetSnapshot) -> Result<Self> {
         if snapshot.max_skip == 0 || snapshot.max_skip > MAX_SKIP {
+            return Err(Error::RatchetState);
+        }
+        if snapshot.transcript.len() > 4096 {
             return Err(Error::RatchetState);
         }
         if snapshot.skipped.len() > snapshot.max_skip as usize {
@@ -336,7 +346,7 @@ impl Ratchet {
 
         let mut skipped = BTreeMap::new();
         for entry in &snapshot.skipped {
-            skipped.insert((entry.dh, entry.n), entry.key);
+            skipped.insert((entry.dh, entry.n), (entry.key, entry.at));
         }
 
         Ok(Self {
@@ -388,7 +398,8 @@ impl Ratchet {
     /// the sealed envelope gives the attacker chosen headers, but not
     /// valid tags.
     pub fn decrypt(&mut self, header: &Header, wire: &[u8]) -> Result<Vec<u8>> {
-        if wire.len() < aead::NONCE_LEN + aead::TAG_LEN {
+        // Bounded input before any allocation (audit M-C4).
+        if wire.len() < aead::NONCE_LEN + aead::TAG_LEN || wire.len() > 64 * 1024 {
             return Err(Error::InvalidLength);
         }
 
@@ -399,9 +410,9 @@ impl Ratchet {
 
         // Skipped key (out-of-order delivery): try it without consuming
         // it first; only a successful decrypt removes it.
-        if let Some(message_key) = self.skipped.get(&(header.dh, header.n)).copied() {
+        if let Some((message_key, _)) = self.skipped.get(&(header.dh, header.n)).copied() {
             let plaintext = aead::decrypt(&message_key, &nonce, &aad, ciphertext)?;
-            if let Some(mut used) = self.skipped.remove(&(header.dh, header.n)) {
+            if let Some((mut used, _)) = self.skipped.remove(&(header.dh, header.n)) {
                 used.zeroize();
             }
             return Ok(plaintext);
@@ -497,10 +508,15 @@ impl Ratchet {
         let start = self.recv_count;
         let mut chain = self.recv_chain.take().ok_or(Error::RatchetState)?;
 
+        let at = crate::now_unix();
         for offset in 0..missing {
             let message_key = chain.next();
-            self.skipped.insert((remote, start + offset), message_key);
+            self.skipped
+                .insert((remote, start + offset), (message_key, at));
         }
+        // TTL eviction (audit M-C3).
+        let cutoff = at.saturating_sub(SKIPPED_TTL_SECONDS);
+        self.skipped.retain(|_, (_, inserted)| *inserted >= cutoff);
 
         self.recv_chain = Some(chain);
         self.recv_count = until;
@@ -538,7 +554,7 @@ impl Drop for Ratchet {
     fn drop(&mut self) {
         self.root_key.zeroize();
         self.transcript.zeroize();
-        for key in self.skipped.values_mut() {
+        for (key, _) in self.skipped.values_mut() {
             key.zeroize();
         }
     }

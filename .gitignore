@@ -5,6 +5,11 @@
 state.enc
 state.enc.tmp
 
+# Client runtime data that must never be committed (audit L21/L22).
+settings.json
+tor-arti-*/
+.openchat/
+
 # Local idea backlog: never publish to GitHub.
 .ideas
 

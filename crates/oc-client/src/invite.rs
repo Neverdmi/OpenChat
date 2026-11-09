@@ -79,6 +79,10 @@ impl Invite {
     /// Parse and verify an invite link.
     pub fn decode(link: &str) -> Result<Self> {
         let link = link.trim();
+        // Cap absurd pastes before any copying/parsing (audit M-L1).
+        if link.len() > 16 * 1024 {
+            return Err(Error::Invite);
+        }
         let rest = link.strip_prefix(INVITE_PREFIX).ok_or(Error::Invite)?;
         let mut parts = rest.split('/').filter(|part| !part.is_empty());
 

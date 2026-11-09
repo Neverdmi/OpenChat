@@ -35,6 +35,15 @@ pub fn random_array<const N: usize>() -> [u8; N] {
     out
 }
 
+/// Constant-time equality for key material (audit L5).
+pub fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 /// X25519 key agreement with a contributory check (audit H1).
 ///
 /// A low-order public key would force the shared secret to the known

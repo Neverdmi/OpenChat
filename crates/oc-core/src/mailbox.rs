@@ -48,6 +48,7 @@ impl MailboxChain {
 
     /// Secret scalar for a slot. Only the inbox owner needs this.
     pub fn slot_secret(&self, epoch: u32, index: u32) -> [u8; 32] {
+        debug_assert!(index < SLOTS_PER_EPOCH, "slot index out of range");
         let mut info = b"openchat/slot/v1".to_vec();
         info.extend_from_slice(&epoch.to_le_bytes());
         info.extend_from_slice(&index.to_le_bytes());
@@ -73,35 +74,38 @@ pub fn epoch_of(unix_seconds: u64) -> u32 {
     (unix_seconds / EPOCH_SECONDS) as u32
 }
 
-/// Secret scalar of the bundle mailbox for `peer_id`.
+/// Secret scalar for a public mailbox derived from `peer_id`.
 ///
 /// The derivation input is public (the peer id is in every invite), so
 /// anyone can compute the mailbox address; only the owner — who can run
-/// the same derivation — holds the scalar to read it. The mailbox carries
-/// the owner's signed prekey bundle for short invites (see SPEC §4.2).
+/// the same derivation — holds the scalar to read it.
+fn derived_mailbox_secret(peer_id: &[u8; 32], domain: &[u8]) -> [u8; 32] {
+    hkdf32(&[], peer_id, domain)
+}
+
+fn derived_mailbox_public(peer_id: &[u8; 32], domain: &[u8]) -> [u8; 32] {
+    let secret = StaticSecret::from(derived_mailbox_secret(peer_id, domain));
+    PublicKey::from(&secret).to_bytes()
+}
+
+/// Secret scalar of the bundle mailbox (SPEC §4.2).
 pub fn bundle_mailbox_secret(peer_id: &[u8; 32]) -> [u8; 32] {
-    hkdf32(&[], peer_id, b"openchat/bundle-mailbox/v1")
+    derived_mailbox_secret(peer_id, b"openchat/bundle-mailbox/v1")
 }
 
 /// Public address of the bundle mailbox for `peer_id`.
 pub fn bundle_mailbox_public(peer_id: &[u8; 32]) -> [u8; 32] {
-    let secret = StaticSecret::from(bundle_mailbox_secret(peer_id));
-    PublicKey::from(&secret).to_bytes()
+    derived_mailbox_public(peer_id, b"openchat/bundle-mailbox/v1")
 }
 
-/// Secret scalar of the WebRTC signaling mailbox for `peer_id`.
-///
-/// Same public-derivation pattern as the bundle mailbox: anyone with
-/// the peer id can address it, only the owner can read it. Carries SDP
-/// offers/answers and ICE candidates (SPEC §9.1, carrier #3).
+/// Secret scalar of the WebRTC signaling mailbox (SPEC §9.1, carrier #3).
 pub fn signaling_mailbox_secret(peer_id: &[u8; 32]) -> [u8; 32] {
-    hkdf32(&[], peer_id, b"openchat/webrtc-signaling/v1")
+    derived_mailbox_secret(peer_id, b"openchat/webrtc-signaling/v1")
 }
 
 /// Public address of the WebRTC signaling mailbox for `peer_id`.
 pub fn signaling_mailbox_public(peer_id: &[u8; 32]) -> [u8; 32] {
-    let secret = StaticSecret::from(signaling_mailbox_secret(peer_id));
-    PublicKey::from(&secret).to_bytes()
+    derived_mailbox_public(peer_id, b"openchat/webrtc-signaling/v1")
 }
 
 #[cfg(test)]

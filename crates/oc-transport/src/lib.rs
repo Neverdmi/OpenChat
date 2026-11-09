@@ -27,6 +27,9 @@ pub use mqtt::MqttClient;
 pub use pool::RelayPool;
 pub use socks5::{TorConfig, TorMode};
 
+/// Default timeout for transport operations.
+pub(crate) const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Stream of events delivered by a carrier.
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<RelayEvent>> + Send>>;
 

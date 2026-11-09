@@ -125,8 +125,9 @@ impl RelayManifest {
         urls_from_entries(&self.relays)
     }
 
-    /// Validate and return the relay URLs.
-    pub fn urls(&self) -> Result<Vec<String>> {
+    /// Validate and return the relay URLs *without* verifying the
+    /// signature. Prefer [`RelayManifest::verify`] (audit M-T9).
+    pub fn unverified_urls(&self) -> Result<Vec<String>> {
         urls_from_entries(&self.relays)
     }
 }

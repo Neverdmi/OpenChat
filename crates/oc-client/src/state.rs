@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use oc_core::identity::{Identity, PublicIdentity, safety_number};
+use oc_core::identity::{Identity, PublicIdentity};
 use oc_core::ratchet::RatchetSnapshot;
 use oc_core::x3dh::{PREKEY_PAIR_LEN, PrekeyBundle, PrekeyPair};
 use oc_core::{now_unix, random_array};
@@ -167,6 +167,7 @@ impl ContactRecord {
 
 /// Full client state.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientState {
     /// State format version.
     pub version: u32,
@@ -364,13 +365,27 @@ impl ClientState {
     }
 
     /// Remember a processed message id.
+    ///
+    /// Eviction is per-peer (audit M-L4): one flooding peer can only
+    /// evict its own oldest entries, never another peer's dedup state.
     pub fn mark_seen(&mut self, peer_id: &[u8; 32], msg_id: &[u8; 16]) {
         let key = seen_key(peer_id, msg_id);
         if self.seen.contains(&key) {
             return;
         }
         if self.seen.len() >= SEEN_CAPACITY {
-            self.seen.pop_front();
+            // Keys are `hex(peer_id) || hex(msg_id)`; evict the oldest
+            // entry of this peer, not the global oldest.
+            let peer_hex = hex::encode(peer_id);
+            if let Some(index) = self
+                .seen
+                .iter()
+                .position(|entry| entry.starts_with(&peer_hex))
+            {
+                self.seen.remove(index);
+            } else {
+                self.seen.pop_front();
+            }
         }
         self.seen.push_back(key);
     }
@@ -480,11 +495,18 @@ impl ClientState {
     }
 
     /// Merge relay URLs, preserving order and dropping duplicates.
+    /// Maximum configured relays (hint-flood cap, audit M-L2).
+    pub const MAX_RELAYS: usize = 32;
+
+    /// Add relays to the configured list (capped, audit M-L2).
     pub fn add_relays<I>(&mut self, relays: I)
     where
         I: IntoIterator<Item = String>,
     {
         for relay in relays {
+            if self.relays.len() >= Self::MAX_RELAYS {
+                break;
+            }
             if !self.relays.contains(&relay) {
                 self.relays.push(relay);
             }
@@ -514,20 +536,32 @@ impl ClientState {
             }
         }
         self.bundle()?;
+        // Size caps (audit M-L9): a corrupted or hostile state must not
+        // expand into unbounded in-memory structures.
+        if self.contacts.len() > 512 {
+            return Err(Error::State("too many contacts".into()));
+        }
+        if self.outbox.len() > OUTBOX_CAPACITY {
+            return Err(Error::State("outbox too large".into()));
+        }
+        if self.cursors.len() > CURSOR_CAPACITY {
+            return Err(Error::State("too many cursors".into()));
+        }
+        let mut peer_ids = std::collections::HashSet::new();
         for contact in &self.contacts {
             if !contact.is_consistent() {
                 return Err(Error::State("contact keys do not match peer id".into()));
+            }
+            if !peer_ids.insert(contact.peer_id) {
+                return Err(Error::State("duplicate contact".into()));
+            }
+            if contact.slot_mask != 0 && contact.slot_mask.count_ones() > 32 {
+                return Err(Error::State("invalid slot mask".into()));
             }
         }
         Ok(())
     }
 
-    /// Compute the safety number with a contact's identity.
-    pub fn safety_number(&self, contact: &ContactRecord) -> Result<[u8; 32]> {
-        let me = self.identity()?.public();
-        let peer = contact.public_identity()?;
-        Ok(safety_number(&me, &peer))
-    }
 }
 
 /// Build a fresh contact record from a completed handshake.

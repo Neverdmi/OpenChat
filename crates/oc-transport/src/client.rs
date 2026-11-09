@@ -12,8 +12,8 @@ use url::Url;
 use crate::socks5::TorConfig;
 use crate::ws::{next_frame, send_frame, ws_connect, BoxWsStream};
 use crate::{Carrier, Error, EventStream, Result};
+use crate::OP_TIMEOUT;
 
-const OP_TIMEOUT: Duration = Duration::from_secs(15);
 const WS_PATH: &str = "/ws";
 
 static INSTALL_PROVIDER: Once = Once::new();
@@ -107,8 +107,15 @@ impl RelayClient {
         let text = serde_json::to_string(message)?;
         send_frame(&mut socket, Message::Text(text.into())).await?;
 
+        // Overall deadline (audit M-T4): trickling frames must not
+        // pin this call forever.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            let frame = tokio::time::timeout(OP_TIMEOUT, next_frame(&mut socket))
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Timeout);
+            }
+            let frame = tokio::time::timeout(remaining, next_frame(&mut socket))
                 .await
                 .map_err(|_| Error::Timeout)??;
             match frame {

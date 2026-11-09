@@ -27,7 +27,6 @@
 //!
 //! Optional `user:pass@` userinfo is sent as MQTT username/password.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -42,8 +41,8 @@ use crate::socks5::{connect_tcp_mode, TorConfig};
 use crate::ws::{ws_connect, BoxWsStream};
 
 use crate::{Carrier, Error, EventStream, Result};
+use crate::OP_TIMEOUT;
 
-const OP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Send a `PINGREQ` after this much inbound silence on a subscription.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// MQTT keep-alive advertised in `CONNECT`, in seconds.
@@ -298,12 +297,8 @@ impl MqttClient {
         let tcp = tokio::time::timeout(OP_TIMEOUT, connect_tcp_mode(&self.tor, &host, port))
             .await
             .map_err(|_| Error::Timeout)??;
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        // Shared cached TLS config (audit M-T10).
+        let connector = tokio_rustls::TlsConnector::from(crate::ws::tls_config());
         tokio::time::timeout(OP_TIMEOUT, connector.connect(server_name, tcp))
             .await
             .map_err(|_| Error::Timeout)?
@@ -360,11 +355,16 @@ impl Carrier for MqttClient {
         let packet_id = next_packet_id();
         conn.send_packet(build_subscribe(packet_id, &topics))
             .await?;
-        // Wait for the SUBACK, silently absorbing anything else.
+        // Wait for the SUBACK and validate every granted QoS (audit M-T3):
+        // `0x80` means the broker refused the subscription.
+        let packet_id_expected = packet_id;
         loop {
             let packet = next_packet(&mut conn).await?;
             if packet_opcode(&packet) == OP_SUBACK {
-                break;
+                match parse_suback(&packet, packet_id_expected, topics.len()) {
+                    Ok(()) => break,
+                    Err(message) => return Err(Error::Relay(message)),
+                }
             }
         }
         Ok(subscription_stream(conn))
@@ -489,7 +489,10 @@ fn build_connect(client_id: &str, username: &str, password: Option<&str>) -> Vec
     encode_string("MQTT", &mut body);
     body.extend_from_slice(&[4]); // protocol level 3.1.1
     let mut flags = 0x02; // clean session
-    if !username.is_empty() {
+    // A password without a username is still sent (empty username
+    // string with both flags set), instead of being silently dropped
+    // (audit M-T10).
+    if !username.is_empty() || password.is_some() {
         flags |= 0x80;
         if password.is_some() {
             flags |= 0x40;
@@ -498,7 +501,7 @@ fn build_connect(client_id: &str, username: &str, password: Option<&str>) -> Vec
     body.push(flags);
     body.extend_from_slice(&KEEPALIVE_SECS.to_be_bytes());
     encode_string(client_id, &mut body);
-    if !username.is_empty() {
+    if !username.is_empty() || password.is_some() {
         encode_string(username, &mut body);
         if let Some(password) = password {
             encode_string(password, &mut body);
@@ -578,10 +581,36 @@ fn parse_puback(data: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes([body[0], body[1]]))
 }
 
+/// Validate a SUBACK: matching packet id and no `0x80` failures.
+fn parse_suback(data: &[u8], expected_id: u16, expected_topics: usize) -> std::result::Result<(), String> {
+    let (opcode, body) = split_packet(data).ok_or("malformed SUBACK")?;
+    if opcode != OP_SUBACK || body.len() < 2 {
+        return Err("malformed SUBACK".into());
+    }
+    if u16::from_be_bytes([body[0], body[1]]) != expected_id {
+        return Err("SUBACK for wrong packet id".into());
+    }
+    let granted = &body[2..];
+    if granted.len() != expected_topics {
+        return Err("SUBACK topic count mismatch".into());
+    }
+    if granted.contains(&0x80) {
+        return Err("broker refused a subscription".into());
+    }
+    Ok(())
+}
+
 /// Parse a `PUBLISH` into (topic, payload, qos, packet id).
+///
+/// Retained messages are dropped by the caller (audit M-T3): public
+/// brokers replay retained payloads forever, which our live-only
+/// delivery must not treat as fresh events.
 fn parse_publish(data: &[u8]) -> Option<(String, Vec<u8>, u8, Option<u16>)> {
     if data.is_empty() {
         return None;
+    }
+    if data[0] & 0x01 != 0 {
+        return None; // retained
     }
     let qos = (data[0] >> 1) & 0x03;
     let (_, body) = split_packet(data)?;

@@ -17,5 +17,5 @@ hex = "0.4"
 oc-client = { path = "../oc-client" }
 oc-transport = { path = "../oc-transport" }
 rpassword = "7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "io-std", "time"] }
 zeroize = "1"

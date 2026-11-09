@@ -81,6 +81,11 @@ struct RateBucket {
     updated: Instant,
 }
 
+/// Maximum concurrent WebSocket connections (audit M-T1).
+const MAX_CONNECTIONS: usize = 1024;
+/// Idle timeout per connection: no frame for 5 minutes closes it.
+const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 #[derive(Clone)]
 struct AppState {
     config: RelayConfig,
@@ -91,6 +96,8 @@ struct AppState {
     order: Arc<RwLock<VecDeque<[u8; 32]>>>,
     /// Per-IP publish buckets.
     rates: Arc<tokio::sync::Mutex<HashMap<IpAddr, RateBucket>>>,
+    /// Concurrent-connection semaphore (audit M-T1).
+    connection_permits: Arc<tokio::sync::Semaphore>,
     tx: broadcast::Sender<RelayEvent>,
 }
 
@@ -224,6 +231,7 @@ impl Relay {
                 totals: Arc::new(RwLock::new((0, 0))),
                 order: Arc::new(RwLock::new(VecDeque::new())),
                 rates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                connection_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
                 tx,
             },
         }
@@ -306,8 +314,15 @@ async fn ws_handler(
     Query(params): Query<SubscribeParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // Connection cap: refuse the upgrade when full.
+    let Ok(permit) = state.connection_permits.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     ws.max_message_size(MAX_BODY_BYTES)
-        .on_upgrade(move |socket| client_loop(socket, state, params, peer.ip()))
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            client_loop(socket, state, params, peer.ip()).await;
+        })
 }
 
 async fn client_loop(
@@ -338,6 +353,8 @@ async fn client_loop(
 
     loop {
         tokio::select! {
+            // Idle timeout: close connections with no frame for 5 min.
+            _ = tokio::time::sleep(CONNECTION_IDLE_TIMEOUT) => break,
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
@@ -429,7 +446,10 @@ async fn client_loop(
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // Behind the broadcast window: close so the client
+                    // reconnects and replays from its cursor instead of
+                    // silently losing events (audit M-T6).
+                    Err(broadcast::error::RecvError::Lagged(_)) => break,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }

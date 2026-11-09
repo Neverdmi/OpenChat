@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
-use rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
+use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::RTCIceCandidateInit;
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
@@ -353,13 +353,17 @@ impl WebRtcSession {
         }
     }
 
-    async fn add_candidate(&self, candidate: &str, url: Option<String>) -> Result<()> {
+    async fn add_candidate(&self, candidate: &str, _url: Option<String>) -> Result<()> {
+        // The `url` field arrives from the peer and must be ignored
+        // (audit M-L11): a malicious peer could otherwise point our
+        // ICE at their own STUN/TURN server and harvest our IP. We
+        // only ever use the STUN servers from our own configuration.
         let init = RTCIceCandidateInit {
             candidate: candidate.to_string(),
             sdp_mid: Some("0".to_string()),
             sdp_mline_index: Some(0),
             username_fragment: None,
-            url,
+            url: None,
         };
         self.peer_connection
             .add_ice_candidate(init)
@@ -446,10 +450,6 @@ impl WebRtcSession {
             && now.saturating_sub(self.last_offer) > 10
     }
 
-    /// The data-channel state type (for open checks in tests).
-    pub fn sdp_type_offer() -> RTCSdpType {
-        RTCSdpType::Offer
-    }
 }
 
 #[cfg(test)]
@@ -505,8 +505,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sdp_type_helper() {
-        assert_eq!(WebRtcSession::sdp_type_offer(), RTCSdpType::Offer);
-    }
 }

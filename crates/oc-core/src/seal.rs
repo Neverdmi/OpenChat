@@ -36,9 +36,12 @@ pub fn seal(mailbox_pk: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
     Ok(wire)
 }
 
+/// Maximum accepted sealed-envelope size (audit M-C4).
+pub const MAX_SEALED_LEN: usize = 64 * 1024 + SEAL_OVERHEAD;
+
 /// Decrypt a sealed envelope with the mailbox secret key.
 pub fn open(mailbox_sk: &[u8; 32], wire: &[u8]) -> Result<Vec<u8>> {
-    if wire.len() < SEAL_OVERHEAD {
+    if wire.len() < SEAL_OVERHEAD || wire.len() > MAX_SEALED_LEN {
         return Err(Error::InvalidLength);
     }
     if wire[0] != PROTOCOL_VERSION {

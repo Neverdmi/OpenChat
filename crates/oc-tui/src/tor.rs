@@ -19,13 +19,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tor_rtcompat::PreferredRuntime;
 
 /// Bootstrapped Tor client handle.
-pub type TorHandle = Arc<TorClient<PreferredRuntime>>;
+pub(crate) type TorHandle = Arc<TorClient<PreferredRuntime>>;
 
 /// Built-in Tor bridges (obfs4 + webtunnel), embedded so Tor works in
 /// censored networks without manual config. Requires the PT binaries
 /// `obfs4proxy` and `webtunnel-client`. Note: bridges in a public repo
 /// get blocked faster — replace them here when they die.
-pub const TOR_BRIDGES: &[&str] = &[
+pub(crate) const TOR_BRIDGES: &[&str] = &[
     "obfs4 51.38.220.224:24885 54CE8314507E15AD7B5F61DEBA6372E46C2A07EB cert=jr7h5jLJLoot4ufBd+676hitBxRE3a05vcBzjmsavf300vvY+8TfCfWNJYxwr9T5SveJfg iat-mode=0",
     "obfs4 51.161.81.197:65168 AC5FCFC2ACF33D3A800356E05D42BA68A7262AA3 cert=8mosjcVPEi3In4p/E+xGUC5sMSDKxXH2LG2SwkVK37deKnQwV6wPpHP3rRQuty3i3VbiNQ iat-mode=0",
     // NOTE (audit H14): the previously listed webtunnel bridges used
@@ -61,8 +61,11 @@ fn build_config(home: &Path, use_bridges: bool) -> Result<TorClientConfig, Strin
         // `obfs4proxy` for obfs4, `webtunnel-client` for webtunnel.
         for (protocol, binary) in [("obfs4", "obfs4proxy"), ("webtunnel", "webtunnel-client")] {
             let mut transport = arti_client::config::pt::TransportConfigBuilder::default();
+            let parsed = protocol
+                .parse()
+                .map_err(|error| format!("pluggable transport name: {error}"))?;
             transport
-                .protocols(vec![protocol.parse().unwrap()])
+                .protocols(vec![parsed])
                 .path(arti_client::config::CfgPath::new(binary.to_string()))
                 .run_on_startup(true);
             builder.bridges().transports().push(transport);

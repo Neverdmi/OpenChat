@@ -51,8 +51,20 @@ impl PrekeyBundle {
         )
     }
 
-    /// Verify the owner's signature.
+    /// Verify the owner's signature, plus freshness (audit M-C1):
+    /// future-dated bundles and bundles older than the retired-prekey
+    /// window are rejected, and the PQ key must be exactly ML-KEM-768.
     pub fn verify(&self) -> Result<()> {
+        let now = crate::now_unix();
+        if self.created_at > now.saturating_add(300) {
+            return Err(Error::InvalidLength);
+        }
+        if now.saturating_sub(self.created_at) > 14 * 86_400 {
+            return Err(Error::InvalidLength);
+        }
+        if self.pq_prekey.len() != crate::pq::MLKEM768_EK_LEN {
+            return Err(Error::InvalidLength);
+        }
         self.identity
             .verify(&self.signing_message(), &self.signature)
     }
@@ -70,7 +82,7 @@ impl PrekeyBundle {
     /// `version(1) | Ed25519(32) | X25519(32) | SPK(32) | created_at(8) |
     /// pq_len(2) | PQK | signature(64)`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let pq_len = u16::try_from(self.pq_prekey.len()).unwrap_or(u16::MAX);
+        let pq_len = u16::try_from(self.pq_prekey.len()).expect("pq key length fits u16");
         let mut out = Vec::with_capacity(BUNDLE_OVERHEAD + self.pq_prekey.len());
         out.push(PROTOCOL_VERSION);
         out.extend_from_slice(&self.identity.ed_bytes());
@@ -135,7 +147,7 @@ fn bundle_signing_message(
     message.extend_from_slice(&identity.dh_bytes());
     message.extend_from_slice(signed_prekey);
     message.extend_from_slice(&created_at.to_le_bytes());
-    let pq_len = u16::try_from(pq_prekey.len()).unwrap_or(u16::MAX);
+    let pq_len = u16::try_from(pq_prekey.len()).expect("pq key length fits u16");
     message.extend_from_slice(&pq_len.to_le_bytes());
     message.extend_from_slice(pq_prekey);
     message
@@ -216,7 +228,7 @@ impl Initiation {
     /// Serialize as `version(1) | Ed25519(32) | X25519(32) | eph(32) |
     /// pq_len(2) | PQ ciphertext`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let pq_len = u16::try_from(self.pq_ciphertext.len()).unwrap_or(u16::MAX);
+        let pq_len = u16::try_from(self.pq_ciphertext.len()).expect("pq ciphertext length fits u16");
         let mut out = Vec::with_capacity(INITIATION_OVERHEAD + self.pq_ciphertext.len());
         out.push(PROTOCOL_VERSION);
         out.extend_from_slice(&self.initiator.ed_bytes());
@@ -283,6 +295,10 @@ pub fn initiate(me: &Identity, bundle: &PrekeyBundle) -> Result<(Initiation, [u8
 /// Run the responder side of the handshake.
 pub fn respond(me: &Identity, prekeys: &PrekeyPair, initiation: &Initiation) -> Result<[u8; 32]> {
     let my_public = me.public();
+    // Self-handshakes are meaningless and enable reflection attacks.
+    if initiation.initiator.peer_id() == my_public.peer_id() {
+        return Err(Error::InvalidKey);
+    }
     let ephemeral = PublicKey::from(initiation.ephemeral);
 
     let dh1 = crate::dh_shared(&prekeys.signed_prekey, &initiation.initiator.dh)?;

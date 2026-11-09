@@ -293,8 +293,8 @@ impl Client {
         // confirmed contact. An unverified record may be replaced because the
         // previous handshake was never proved by a ratchet message.
         if let Some(existing) = self.state.contact(&invite.peer_id) {
-            let keys_changed = existing.ed != bundle.identity.ed_bytes()
-                || existing.dh != bundle.identity.dh_bytes();
+            let keys_changed = !oc_core::ct_eq(&existing.ed, &bundle.identity.ed_bytes())
+                || !oc_core::ct_eq(&existing.dh, &bundle.identity.dh_bytes());
             if keys_changed && existing.verified {
                 return Err(Error::Tofu);
             }
@@ -558,6 +558,10 @@ impl Client {
                 let delay = OUTBOX_BASE_DELAY_SECONDS
                     .saturating_mul(1u64 << shift)
                     .min(OUTBOX_MAX_DELAY_SECONDS);
+                // Full jitter ±25% so many clients do not retry in
+                // lockstep against recovering relays (audit M-L7).
+                let jitter = u32::from_le_bytes(random_array::<4>()) % 50;
+                let delay = (delay as f64 * (0.75 + jitter as f64 / 100.0)) as u64;
                 entry.next_attempt_at = now.saturating_add(delay);
             }
         }
@@ -601,7 +605,8 @@ impl Client {
             .contact_mut(peer_id)
             .ok_or(Error::UnknownContact)?;
         contact.ratchet = ratchet.snapshot();
-        self.state.mark_seen(peer_id, &msg_id);
+        // Note: the sender does not mark its own message as seen —
+        // dedup state belongs to the receiving side (audit L11).
 
         let now = now_unix();
         Ok(OutboxRecord {
@@ -706,6 +711,12 @@ impl Client {
                     // instead of failing the whole listen pass.
                     Ok(Some(Err(_))) => break,
                     Ok(Some(Ok(event))) => {
+                        // Only subscribed mailboxes advance cursors:
+                        // unknown-mailbox floods must not fill the
+                        // cursor table (audit M-L5).
+                        if !map.contains_key(&event.mailbox) {
+                            continue;
+                        }
                         let epoch = match map.get(&event.mailbox) {
                             Some(MailboxRef::Inbox { epoch, .. }) => Some(*epoch),
                             _ => None,
@@ -755,8 +766,8 @@ impl Client {
         }
 
         for (peer_id, msg_id) in pending_acks {
-            self.send_ack(&peer_id, &msg_id, pool, DEFAULT_FANOUT)
-                .await?;
+            // One failing ack must not abort the whole pass (L8).
+            let _ = self.send_ack(&peer_id, &msg_id, pool, DEFAULT_FANOUT).await;
         }
 
         Ok(outcome)
@@ -867,10 +878,17 @@ impl Client {
         }
 
         let epoch = mailbox::epoch_of(now_unix());
+        // Include the previous epoch too: clock skew must not lose
+        // messages sent just before the local epoch rolled over (L6).
+        let epochs = [
+            epoch.saturating_sub(1),
+            epoch,
+            epoch.wrapping_add(1),
+        ];
         for contact in &self.state.contacts {
             // Our inbox: owner = self, peer = contact.
             let chain = MailboxChain::derive(&contact.mailbox_root, &me, &contact.peer_id);
-            for current in [epoch, epoch.wrapping_add(1)] {
+            for current in epochs {
                 for index in 0..SLOTS_PER_EPOCH {
                     let public = chain.slot_public(current, index);
                     map.insert(
@@ -969,9 +987,15 @@ impl Client {
 
     /// Handle a bundle request sealed to our bundle mailbox: flag a
     /// bundle publish for the next listen pass (on-demand fetch).
+    ///
+    /// Honored at most once a minute so replayed or flooded requests
+    /// cannot force a re-publish every pass (audit M-L3).
     fn process_bundle_request(&mut self, secret: &[u8; 32], payload: &[u8]) -> Result<Processed> {
         if seal::open(secret, payload).is_ok() {
-            self.bundle_requested = true;
+            let now = now_unix();
+            if now.saturating_sub(self.last_bundle_publish) > 60 {
+                self.bundle_requested = true;
+            }
         }
         Ok(Processed::Ignored)
     }
@@ -1070,10 +1094,14 @@ impl Client {
         // same keys is ignored: replacing the session here would drop
         // the established ratchet (audit H19).
         if let Some(existing) = self.state.contact(&peer_id) {
-            let keys_changed = existing.ed != initiation.initiator.ed_bytes()
-                || existing.dh != initiation.initiator.dh_bytes();
+            let keys_changed = !oc_core::ct_eq(&existing.ed, &initiation.initiator.ed_bytes())
+                || !oc_core::ct_eq(&existing.dh, &initiation.initiator.dh_bytes());
+            // Inbound TOFU mismatches are ignored, not fatal: one
+            // forged handshake must not abort the whole listen pass
+            // (audit L9). The user-initiated `add_invite` path still
+            // surfaces `Error::Tofu`.
             if keys_changed && existing.verified {
-                return Err(Error::Tofu);
+                return Ok(Processed::Ignored);
             }
             if !keys_changed && existing.verified {
                 return Ok(Processed::Ignored);
@@ -1137,7 +1165,10 @@ impl Client {
             _ => return Ok(Processed::Ignored),
         };
 
-        let contact = self.state.contact(peer_id).ok_or(Error::UnknownContact)?;
+        // Unknown senders are ignored, not fatal (audit L10).
+        let Some(contact) = self.state.contact(peer_id) else {
+            return Ok(Processed::Ignored);
+        };
         let mut ratchet = Ratchet::from_snapshot(&contact.ratchet)?;
         let padded = match ratchet.decrypt(&header, &ciphertext) {
             Ok(padded) => padded,
@@ -1153,22 +1184,18 @@ impl Client {
         };
 
         // A successful ratchet decrypt proves the peer holds the private
-        // identity key behind the pinned public keys.
+        // identity key behind the pinned public keys. Verification is
+        // only granted for fresh messages (audit M-L6): a replayed
+        // duplicate must not flip `verified` without a new proof.
         let msg_id = body.msg_id();
-        let already_seen = self.state.seen(peer_id, &msg_id);
+        if self.state.seen(peer_id, &msg_id) {
+            return Ok(Processed::Ignored);
+        }
         let contact = self
             .state
             .contact_mut(peer_id)
             .ok_or(Error::UnknownContact)?;
-        let was_unverified = !contact.verified;
         contact.verified = true;
-
-        if already_seen {
-            if was_unverified {
-                self.save()?;
-            }
-            return Ok(Processed::Ignored);
-        }
 
         contact.ratchet = ratchet.snapshot();
         self.state.mark_seen(peer_id, &msg_id);

@@ -18,7 +18,7 @@ use crate::settings::{self, Settings};
 
 /// One contact as shown in the sidebar.
 #[derive(Debug, Clone)]
-pub struct ContactView {
+pub(crate) struct ContactView {
     /// Peer id.
     pub peer_id: [u8; 32],
     /// Short display id.
@@ -31,7 +31,7 @@ pub struct ContactView {
 
 /// One line in the conversation view.
 #[derive(Debug, Clone)]
-pub struct ChatLine {
+pub(crate) struct ChatLine {
     /// Display name of the sender (`me` for outgoing).
     pub author: String,
     /// Message text.
@@ -42,13 +42,15 @@ pub struct ChatLine {
 
 /// Events flowing from the worker thread to the UI thread.
 #[derive(Debug)]
-pub enum UiEvent {
+pub(crate) enum UiEvent {
     /// Fresh contact/invite/outbox snapshot.
     Snapshot {
         /// Contacts in sidebar order.
         contacts: Vec<ContactView>,
-        /// Our invite link.
+        /// Our invite link (short form by default).
         invite: String,
+        /// Our full invite link (bundle embedded, long).
+        invite_full: String,
         /// Our own short peer id.
         own_short: String,
         /// Outgoing events still waiting for a relay.
@@ -79,7 +81,7 @@ pub enum UiEvent {
 }
 
 /// Commands flowing from the UI thread to the worker thread.
-pub enum WorkerCommand {
+pub(crate) enum WorkerCommand {
     /// Send text to a peer.
     Send {
         /// Recipient.
@@ -96,7 +98,7 @@ pub enum WorkerCommand {
 }
 
 /// Handles to the running worker thread.
-pub struct Worker {
+pub(crate) struct Worker {
     /// Command channel (UI -> worker).
     pub commands: mpsc::Sender<WorkerCommand>,
     /// Event channel (worker -> UI).
@@ -105,7 +107,7 @@ pub struct Worker {
 
 /// Which unlock-form field is being edited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockField {
+pub(crate) enum LockField {
     /// State directory.
     Home,
     /// Passphrase.
@@ -116,7 +118,7 @@ pub enum LockField {
 
 /// Unlock screen mode: open an existing state or create a new one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockMode {
+pub(crate) enum LockMode {
     /// Open existing encrypted state.
     Unlock,
     /// Create a new identity + state.
@@ -125,7 +127,7 @@ pub enum LockMode {
 
 /// Which panel has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
+pub(crate) enum Focus {
     /// Message input (default).
     Input,
     /// Contact list.
@@ -134,7 +136,7 @@ pub enum Focus {
 
 /// What one submitted input line means.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InputAction {
+pub(crate) enum InputAction {
     /// Nothing to do (blank line).
     Empty,
     /// Leave the TUI.
@@ -156,7 +158,7 @@ pub enum InputAction {
 }
 
 /// Parse one submitted input line.
-pub fn parse_input(line: &str) -> InputAction {
+pub(crate) fn parse_input(line: &str) -> InputAction {
     let line = line.trim();
     if line.is_empty() {
         return InputAction::Empty;
@@ -192,7 +194,7 @@ pub fn parse_input(line: &str) -> InputAction {
 }
 
 /// Application state for the TUI.
-pub struct TuiApp {
+pub(crate) struct TuiApp {
     /// Screen: unlock form or main chat.
     pub locked: bool,
     /// Encrypted-state directory (editable on the unlock screen).
@@ -207,6 +209,8 @@ pub struct TuiApp {
     pub contacts: Vec<ContactView>,
     /// Our invite link from the last snapshot.
     pub invite: String,
+    /// Our full invite link (bundle embedded).
+    pub invite_full: String,
     /// Our own short peer id.
     pub own_short: String,
     /// Outbox size from the last snapshot.
@@ -243,7 +247,7 @@ pub struct TuiApp {
 
 impl TuiApp {
     /// Create the app on the unlock screen.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             locked: true,
             home: default_home().to_string_lossy().into_owned(),
@@ -252,6 +256,7 @@ impl TuiApp {
             worker: None,
             contacts: Vec::new(),
             invite: String::new(),
+            invite_full: String::new(),
             own_short: String::new(),
             copy_requested: false,
             outbox_len: 0,
@@ -272,22 +277,22 @@ impl TuiApp {
     }
 
     /// Currently selected peer id, if any.
-    pub fn selected_peer(&self) -> Option<[u8; 32]> {
+    pub(crate) fn selected_peer(&self) -> Option<[u8; 32]> {
         self.contacts.get(self.selected).map(|c| c.peer_id)
     }
 
     /// Short id of the selected peer, if any.
-    pub fn selected_short(&self) -> Option<String> {
+    pub(crate) fn selected_short(&self) -> Option<String> {
         self.contacts.get(self.selected).map(|c| c.short.clone())
     }
 
     /// Whether a message can be sent right now.
-    pub fn can_send(&self) -> bool {
+    pub(crate) fn can_send(&self) -> bool {
         self.selected_peer().is_some() && !self.input.trim().is_empty()
     }
 
     /// Move the contact selection by `delta` lines, wrapping around.
-    pub fn move_selection(&mut self, delta: i32) {
+    pub(crate) fn move_selection(&mut self, delta: i32) {
         if self.contacts.is_empty() {
             return;
         }
@@ -296,7 +301,7 @@ impl TuiApp {
     }
 
     /// Handle one submitted input line.
-    pub fn submit_input(&mut self) {
+    pub(crate) fn submit_input(&mut self) {
         match parse_input(&self.input) {
             InputAction::Empty => {}
             InputAction::Quit => self.should_quit = true,
@@ -348,16 +353,18 @@ impl TuiApp {
     }
 
     /// Apply one worker event to the UI state.
-    pub fn apply(&mut self, event: UiEvent) {
+    pub(crate) fn apply(&mut self, event: UiEvent) {
         match event {
             UiEvent::Snapshot {
                 contacts,
                 invite,
+                invite_full,
                 own_short,
                 outbox_len,
             } => {
                 self.contacts = contacts;
                 self.invite = invite;
+                self.invite_full = invite_full;
                 self.own_short = own_short;
                 self.outbox_len = outbox_len;
                 if self.selected >= self.contacts.len() {
@@ -392,7 +399,7 @@ impl TuiApp {
     }
 
     /// Push a conversation line, capping history at 500 lines (audit H17).
-    pub fn push_line(&mut self, line: ChatLine) {
+    pub(crate) fn push_line(&mut self, line: ChatLine) {
         self.lines.push(line);
         if self.lines.len() > 500 {
             let excess = self.lines.len() - 500;
@@ -401,7 +408,10 @@ impl TuiApp {
     }
 
     /// Apply one receive pass: messages, acks and new contacts.
-    pub fn apply_outcome(&mut self, outcome: &ListenOutcome) {
+    ///
+    /// Peer-supplied text is sanitized so it cannot inject terminal
+    /// escape sequences (audit M-U2).
+    pub(crate) fn apply_outcome(&mut self, outcome: &ListenOutcome) {
         for peer_id in &outcome.added_contacts {
             self.push_line(ChatLine {
                 author: "system".to_string(),
@@ -412,7 +422,7 @@ impl TuiApp {
         for message in &outcome.messages {
             self.push_line(ChatLine {
                 author: short_peer_id(&message.peer_id),
-                text: message.text.clone(),
+                text: oc_cli::sanitize_terminal_text(&message.text),
                 outgoing: false,
             });
         }
@@ -430,7 +440,7 @@ impl TuiApp {
     }
 
     /// Drain all pending worker events.
-    pub fn poll_events(&mut self) {
+    pub(crate) fn poll_events(&mut self) {
         let events: Vec<UiEvent> = match &self.worker {
             Some(worker) => worker.events.try_iter().collect(),
             None => Vec::new(),
@@ -441,7 +451,7 @@ impl TuiApp {
     }
 
     /// Validate a create-state request without touching the filesystem.
-    pub fn validate_create(&self) -> Result<(), String> {
+    pub(crate) fn validate_create(&self) -> Result<(), String> {
         if StateStore::exists(&PathBuf::from(self.home.trim())) {
             return Err("state already exists here — use Unlock mode".to_string());
         }
@@ -455,7 +465,7 @@ impl TuiApp {
     }
 
     /// Generate a strong memorable passphrase and fill both fields.
-    pub fn generate_passphrase(&mut self) {
+    pub(crate) fn generate_passphrase(&mut self) {
         let generated = generate_passphrase();
         *self.passphrase = generated.clone();
         *self.confirm_passphrase = generated;
@@ -464,7 +474,7 @@ impl TuiApp {
     }
 
     /// Create a new identity + encrypted state and start the worker.
-    pub fn create_state(&mut self) {
+    pub(crate) fn create_state(&mut self) {
         if let Err(message) = self.validate_create() {
             self.error = Some(message);
             return;
@@ -477,14 +487,15 @@ impl TuiApp {
                 .map_err(|error| format!("relay list: {error:#}"))?;
             let client = Client::create(store, relays)
                 .map_err(|error| format!("create client: {error:#}"))?;
-            self.settings = settings::load(&home);
-            Ok(spawn_worker(client, &home, self.settings.clone()))
+            self.settings = settings::load(&home)
+                .map_err(|message| format!("{message} (delete settings.json to reset)"))?;
+            spawn_worker(client, &home, self.settings.clone())
         })();
         self.finish_start(result, "identity created — share your invite with /invite");
     }
 
     /// Try to unlock the state and start the worker thread.
-    pub fn unlock(&mut self) {
+    pub(crate) fn unlock(&mut self) {
         let home = PathBuf::from(self.home.trim());
         if !StateStore::exists(&home) {
             self.error = Some(format!(
@@ -498,8 +509,9 @@ impl TuiApp {
                 .map_err(|error| format!("open state: {error:#}"))?;
             let client = Client::open(store)
                 .map_err(|error| format!("open client: {error:#}"))?;
-            self.settings = settings::load(&home);
-            Ok(spawn_worker(client, &home, self.settings.clone()))
+            self.settings = settings::load(&home)
+                .map_err(|message| format!("{message} (delete settings.json to reset)"))?;
+            spawn_worker(client, &home, self.settings.clone())
         })();
         self.finish_start(result, "unlocked");
     }
@@ -522,7 +534,7 @@ impl TuiApp {
     }
 
     /// Restart the worker with the current settings (after a change).
-    pub fn restart_worker(&mut self) {
+    pub(crate) fn restart_worker(&mut self) {
         if let Some(worker) = &self.worker {
             let _ = worker.commands.send(WorkerCommand::Shutdown);
         }
@@ -531,7 +543,7 @@ impl TuiApp {
     }
 
     /// Persist settings and restart the worker so they take effect.
-    pub fn apply_settings(&mut self) {
+    pub(crate) fn apply_settings(&mut self) {
         let home = PathBuf::from(self.home.trim());
         if let Err(error) = settings::save(&home, &self.settings) {
             self.error = Some(format!("save settings: {error}"));
@@ -542,7 +554,7 @@ impl TuiApp {
     }
 
     /// Cycle the Tor mode by `delta` (settings menu).
-    pub fn cycle_tor(&mut self, delta: i32) {
+    pub(crate) fn cycle_tor(&mut self, delta: i32) {
         self.settings.tor_mode = if delta >= 0 {
             self.settings.tor_mode.next()
         } else {
@@ -552,25 +564,25 @@ impl TuiApp {
     }
 
     /// Adjust fan-out by `delta`, clamped to 1–5 (settings menu).
-    pub fn adjust_fanout(&mut self, delta: i32) {
+    pub(crate) fn adjust_fanout(&mut self, delta: i32) {
         self.settings.fanout = (self.settings.fanout as i32 + delta).clamp(1, 5) as usize;
         self.apply_settings();
     }
 
     /// Toggle "show invite on start" (settings menu).
-    pub fn toggle_invite_on_start(&mut self) {
+    pub(crate) fn toggle_invite_on_start(&mut self) {
         self.settings.show_invite_on_start = !self.settings.show_invite_on_start;
         self.apply_settings();
     }
 
     /// Toggle Tor bridges (settings menu).
-    pub fn toggle_tor_bridges(&mut self) {
+    pub(crate) fn toggle_tor_bridges(&mut self) {
         self.settings.tor_bridges = !self.settings.tor_bridges;
         self.apply_settings();
     }
 
     /// Toggle WebRTC direct delivery (settings menu).
-    pub fn toggle_webrtc(&mut self) {
+    pub(crate) fn toggle_webrtc(&mut self) {
         self.settings.webrtc = !self.settings.webrtc;
         self.apply_settings();
     }
@@ -594,7 +606,7 @@ const PASSPHRASE_WORDS: &[&str] = &[
 /// Generate a strong memorable passphrase: five random words plus a
 /// four-digit suffix, e.g. `amber-flint-garden-4815`. Randomness comes
 /// from the OS CSPRNG via `oc_core::random_array`.
-pub fn generate_passphrase() -> String {
+pub(crate) fn generate_passphrase() -> String {
     let mut parts: Vec<&str> = Vec::with_capacity(5);
     for _ in 0..5 {
         let bytes = oc_core::random_array::<2>();
@@ -605,27 +617,14 @@ pub fn generate_passphrase() -> String {
     format!("{}-{:04}", parts.join("-"), digits)
 }
 
-/// Format a safety number as hex chunks, like the CLI.
-pub fn format_safety(bytes: &[u8; 32]) -> String {
-    bytes
-        .chunks(4)
-        .map(hex::encode)
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Format a safety number as hex chunks (shared with the CLI).
+pub(crate) fn format_safety(bytes: &[u8; 32]) -> String {
+    oc_cli::format_safety(bytes)
 }
 
-/// Default state directory (`~/.openchat`), mirroring the CLI.
-pub fn default_home() -> PathBuf {
-    if let Some(home) = std::env::var_os("OPENCHAT_HOME") {
-        return PathBuf::from(home);
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".openchat");
-    }
-    if let Some(home) = std::env::var_os("USERPROFILE") {
-        return PathBuf::from(home).join(".openchat");
-    }
-    PathBuf::from(".openchat")
+/// Default state directory (`~/.openchat`), shared with the CLI.
+pub(crate) fn default_home() -> PathBuf {
+    oc_cli::default_home()
 }
 
 fn snapshot(client: &Client) -> UiEvent {
@@ -641,6 +640,7 @@ fn snapshot(client: &Client) -> UiEvent {
             })
             .collect(),
         invite: client.invite().unwrap_or_default(),
+        invite_full: client.invite_full().unwrap_or_default(),
         own_short: client
             .peer_id()
             .map(|peer_id| short_peer_id(&peer_id))
@@ -650,22 +650,32 @@ fn snapshot(client: &Client) -> UiEvent {
 }
 
 /// Spawn the background thread that owns the `Client` and the pool.
-pub fn spawn_worker(mut client: Client, home: &std::path::Path, settings: Settings) -> Worker {
+pub(crate) fn spawn_worker(
+    mut client: Client,
+    home: &std::path::Path,
+    settings: Settings,
+) -> Result<Worker, String> {
     client.set_webrtc(settings.webrtc);
     let (command_tx, command_rx) = mpsc::channel::<WorkerCommand>();
     let (event_tx, event_rx) = mpsc::channel::<UiEvent>();
     let home = home.to_path_buf();
     std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .expect("tokio runtime for worker");
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = event_tx.send(UiEvent::Error(format!("tokio runtime: {error}")));
+                return;
+            }
+        };
         runtime.block_on(worker_loop(client, home, settings, command_rx, event_tx));
     });
-    Worker {
+    Ok(Worker {
         commands: command_tx,
         events: event_rx,
-    }
+    })
 }
 
 /// Local SOCKS5 port the embedded Tor proxy listens on.

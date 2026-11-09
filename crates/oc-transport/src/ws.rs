@@ -20,8 +20,8 @@ use url::Url;
 
 use crate::socks5::{connect_tcp_mode, TorConfig};
 use crate::{Error, Result};
+use crate::OP_TIMEOUT;
 
-const OP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum size of the HTTP upgrade response headers.
 const MAX_HEADER_BYTES: usize = 8192;
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -83,12 +83,20 @@ impl AsyncWrite for ConnStream {
 /// WebSocket stream over a buffered connection stream.
 pub type BoxWsStream = WebSocketStream<BufReader<ConnStream>>;
 
-fn tls_config() -> rustls::ClientConfig {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth()
+/// Shared TLS config; the root store is built once (audit M-T10).
+pub(crate) fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+    static CONFIG: std::sync::OnceLock<rustls::ClientConfig> = std::sync::OnceLock::new();
+    Arc::new(
+        CONFIG
+            .get_or_init(|| {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth()
+            })
+            .clone(),
+    )
 }
 
 /// Connect a WebSocket to `url` (`ws://`/`wss://`), honouring the Tor
@@ -115,7 +123,7 @@ pub async fn ws_connect(
     let stream: ConnStream = if tls {
         let server_name = rustls::pki_types::ServerName::try_from(host.clone())
             .map_err(|_| Error::Url("invalid host".into()))?;
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config()));
+        let connector = tokio_rustls::TlsConnector::from(tls_config());
         let tls_stream = tokio::time::timeout(OP_TIMEOUT, connector.connect(server_name, tcp))
             .await
             .map_err(|_| Error::Timeout)?
@@ -170,26 +178,35 @@ pub async fn ws_connect(
 }
 
 /// Read and verify the HTTP 101 upgrade response.
+///
+/// The whole header block has a 5-second budget (audit M-T7,
+/// slowloris), and the status line must start with `HTTP/1.1 101`.
 async fn verify_upgrade(stream: &mut BufReader<ConnStream>, key: &str) -> Result<()> {
-    let mut raw = Vec::new();
-    loop {
-        let mut byte = [0u8; 1];
-        tokio::time::timeout(OP_TIMEOUT, stream.read_exact(&mut byte))
-            .await
-            .map_err(|_| Error::Timeout)?
-            .map_err(|error| Error::Relay(format!("ws read: {error}")))?;
-        raw.push(byte[0]);
-        if raw.len() > MAX_HEADER_BYTES {
-            return Err(Error::Relay("ws handshake headers too large".into()));
+    let read_headers = async {
+        let mut raw = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            stream
+                .read_exact(&mut byte)
+                .await
+                .map_err(|error| Error::Relay(format!("ws read: {error}")))?;
+            raw.push(byte[0]);
+            if raw.len() > MAX_HEADER_BYTES {
+                return Err(Error::Relay("ws handshake headers too large".into()));
+            }
+            if raw.ends_with(b"\r\n\r\n") {
+                break;
+            }
         }
-        if raw.ends_with(b"\r\n\r\n") {
-            break;
-        }
-    }
+        Ok::<Vec<u8>, Error>(raw)
+    };
+    let raw = tokio::time::timeout(Duration::from_secs(5), read_headers)
+        .await
+        .map_err(|_| Error::Timeout)??;
     let text = String::from_utf8_lossy(&raw);
     let mut lines = text.lines();
     let status = lines.next().unwrap_or_default();
-    if !status.contains("101") {
+    if !status.starts_with("HTTP/1.1 101") {
         return Err(Error::Relay(format!("ws upgrade rejected: {status}")));
     }
     let expected = {
@@ -228,13 +245,4 @@ pub async fn next_frame(socket: &mut BoxWsStream) -> Result<Option<Message>> {
     }
 }
 
-/// Receive the next binary frame, skipping other frame types.
-pub async fn next_binary(socket: &mut BoxWsStream) -> Result<Option<Vec<u8>>> {
-    loop {
-        match next_frame(socket).await? {
-            Some(Message::Binary(data)) => return Ok(Some(data.to_vec())),
-            Some(Message::Close(_)) | None => return Ok(None),
-            Some(_) => continue,
-        }
-    }
-}
+

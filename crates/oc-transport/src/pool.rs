@@ -189,6 +189,9 @@ impl RelayPool {
     }
 
     /// Subscribe to several mailboxes through the first relay that accepts.
+    ///
+    /// Attempts race in parallel (audit M-T8): a dead relay costs one
+    /// timeout, not one per relay in sequence.
     pub async fn subscribe_many(&self, mailboxes: &[[u8; 32]], since: u64) -> Result<EventStream> {
         if self.relays.is_empty() {
             return Err(Error::NoRelay);
@@ -197,13 +200,23 @@ impl RelayPool {
             return Err(Error::Relay("no mailboxes requested".into()));
         }
 
+        let indices = pick_indices(self.relays.len(), self.relays.len());
+        let mut pending = futures_util::stream::FuturesUnordered::new();
+        for index in indices {
+            let carrier = Arc::clone(&self.relays[index].carrier);
+            let mailboxes = mailboxes.to_vec();
+            pending.push(async move {
+                (
+                    index,
+                    carrier.subscribe_many(&mailboxes, since).await,
+                )
+            });
+        }
+        // First success wins; losers are dropped (their half-open
+        // connections close).
         let mut last_error = None;
-        for index in pick_indices(self.relays.len(), self.relays.len()) {
-            match self.relays[index]
-                .carrier
-                .subscribe_many(mailboxes, since)
-                .await
-            {
+        while let Some((index, result)) = pending.next().await {
+            match result {
                 Ok(stream) => {
                     self.relays[index].succeeded();
                     return Ok(stream);
@@ -331,11 +344,15 @@ fn reconnect_stream(
 }
 
 fn next_delay(current: Duration) -> Duration {
-    if current.is_zero() {
+    let base = if current.is_zero() {
         RECONNECT_INITIAL
     } else {
         (current * 2).min(RECONNECT_MAX)
-    }
+    };
+    // Full jitter ±25% so reconnecting clients do not synchronise
+    // against recovering relays (audit M-T8).
+    let jitter = u32::from_le_bytes(random_array::<4>()) % 50;
+    base.mul_f64(0.75 + jitter as f64 / 100.0)
 }
 
 /// Pick `count` unique entries from a candidate list, rotated by a random
@@ -351,14 +368,10 @@ fn pick_from(candidates: &[usize], count: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Pick `count` unique indices, rotated by a random offset.
+/// Pick `count` unique indices from `0..len`, rotated by a random offset.
 fn pick_indices(len: usize, count: usize) -> Vec<usize> {
-    if len == 0 {
-        return Vec::new();
-    }
-    let count = count.min(len);
-    let offset = u32::from_le_bytes(random_array::<4>()) as usize % len;
-    (0..count).map(|index| (offset + index) % len).collect()
+    let candidates: Vec<usize> = (0..len).collect();
+    pick_from(&candidates, count)
 }
 
 #[cfg(test)]

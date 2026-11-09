@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `oc` — OpenChat command-line client (thin binary over `oc_cli`).
 
 fn main() {

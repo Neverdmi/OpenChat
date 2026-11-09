@@ -87,10 +87,9 @@ impl StateStore {
     pub fn create(dir: &Path, passphrase: &str) -> Result<Self> {
         let path = Self::path_in(dir);
         if path.exists() {
-            return Err(Error::State(format!(
-                "state already exists at {}",
-                path.display()
-            )));
+            // No full path in errors (audit M-U12): error output lands
+            // on screens and in logs.
+            return Err(Error::State("state already exists".into()));
         }
 
         fs::create_dir_all(dir)?;
@@ -116,7 +115,7 @@ impl StateStore {
         let path = Self::path_in(dir);
         let mut file = fs::File::open(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                Error::State(format!("not initialized at {}", path.display()))
+                Error::State("not initialized (state.enc missing)".into())
             } else {
                 Error::Io(error)
             }
@@ -177,6 +176,8 @@ impl StateStore {
         let nonce = random_array::<{ aead::NONCE_LEN }>();
         let ciphertext = aead::encrypt(&self.key, &nonce, AAD, &plaintext)
             .map_err(|_| Error::State("state encryption failed".into()))?;
+        // Scrub the plaintext copy after sealing (audit L1).
+        let _plaintext_guard = zeroize::Zeroizing::new(plaintext);
 
         let mut contents = Vec::with_capacity(HEADER_LEN + ciphertext.len());
         contents.extend_from_slice(MAGIC);
@@ -187,9 +188,23 @@ impl StateStore {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let temp = self.path.with_extension("enc.tmp");
-        write_private(&temp, &contents)?;
+        // Random-suffixed temp name opened with O_EXCL so a symlink at
+        // the predictable `state.enc.tmp` path cannot redirect the
+        // write (audit M-L8).
+        let temp = self
+            .path
+            .with_extension(format!("enc.{}.tmp", hex::encode(random_array::<8>())));
+        write_private_new(&temp, &contents)?;
         fs::rename(&temp, &self.path)?;
+        // fsync file + directory so a crash cannot lose the rename.
+        if let Ok(file) = fs::File::open(&self.path) {
+            let _ = file.sync_all();
+        }
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 }
@@ -206,9 +221,11 @@ fn derive_key(passphrase: &str, salt: &[u8; SALT_LEN]) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+/// Write with `O_CREAT | O_EXCL`: fails if the (random) path exists,
+/// so no symlink at a predictable temp name can redirect the write.
+fn write_private_new(path: &Path, contents: &[u8]) -> Result<()> {
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
