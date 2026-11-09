@@ -9,9 +9,13 @@ state.enc.tmp
 settings.json
 tor-arti-*/
 .openchat/
+.tor-data/
 
 # Local idea backlog: never publish to GitHub.
 .ideas
 
-# .memory is intentionally tracked: AI agent notes must never be ignored.
-!.memory
+# Local-only working files (audit `fix`, agent memory, specification):
+# kept on disk, never in the public repository.
+fix
+.memory
+SPEC.md
