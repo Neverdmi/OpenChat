@@ -4,7 +4,7 @@
 
 - Спецификация: [SPEC.md](SPEC.md)
 - Статус: P5 — CLI и TUI готовы (GUI удалён); P4 почти готов (ждёт деплоя публичного релея)
-- Тесты: 97 (+15 в oc-tui)
+- Тесты: 100 (+17 в oc-tui)
 
 ## Что уже работает
 
@@ -157,7 +157,8 @@ OPENCHAT_PASSPHRASE='alice-passphrase' ./target/debug/oc --home /tmp/alice chat 
   не нужно);
 - `/add <invite>` (или вставить `openchat://…`) — добавить контакт;
 - `/settings` — меню настроек: Tor-режим (`off`/`fallback`/`always`),
-  Tor-мосты вкл/выкл, fanout, invite при старте;
+  Tor-мосты вкл/выкл, fanout, invite при старте, WebRTC direct delivery
+  (вкл/выкл, по умолчанию выкл.: оба онлайн, собеседник видит твой IP);
 - `/contacts`, `/flush`, `/help`, `/quit`; `Ctrl+C` — выход.
 
 Tor встроен (arti-client, чистый Rust) — внешних программ не нужно.

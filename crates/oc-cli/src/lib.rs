@@ -84,6 +84,11 @@ enum Command {
         /// Number of relays to publish to.
         #[arg(long, default_value_t = 3)]
         fanout: usize,
+
+        /// Attempt WebRTC direct delivery (opt-in; both sides online,
+        /// peer sees your IP).
+        #[arg(long)]
+        webrtc: bool,
     },
 
     /// Listen for incoming handshakes and messages.
@@ -202,9 +207,14 @@ async fn run_inner(argv: Vec<std::ffi::OsString>) -> Result<()> {
             );
             Ok(())
         }
-        Command::Chat { peer, fanout } => {
+        Command::Chat {
+            peer,
+            fanout,
+            webrtc,
+        } => {
             let passphrase = passphrase(false)?;
             let mut client = open_client(&args.home, &passphrase)?;
+            client.set_webrtc(webrtc);
             let pool = build_pool(client.relays())?;
             run_chat(&mut client, &pool, peer, fanout).await
         }
@@ -587,7 +597,8 @@ mod tests {
             args.command,
             Command::Chat {
                 peer: Some(ref peer),
-                fanout: 1
+                fanout: 1,
+                webrtc: false
             } if peer == "ABCD1234"
         ));
     }

@@ -400,3 +400,58 @@ async fn offline_messages_deliver_and_are_acknowledged_after_reconnect() {
     assert_eq!(incoming.acks[0].acked_msg_id, sent.msg_id);
     assert!(alice.is_acked(&bob_id, &sent.msg_id));
 }
+
+#[tokio::test]
+async fn webrtc_data_channel_establishes_between_online_peers() {
+    let url = start_relay().await;
+    let pool = RelayPool::from_urls([url.clone()]).unwrap();
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    let mut alice = client(alice_dir.path(), "alice-passphrase", &url);
+    let mut bob = client(bob_dir.path(), "bob-passphrase", &url);
+    alice.set_webrtc(true);
+    bob.set_webrtc(true);
+
+    let bob_id = bob.peer_id().unwrap();
+
+    // Short invite flow first (bundle fetch), then the handshake.
+    let invite = bob.invite().unwrap();
+    bob.listen_once(&pool, Duration::from_millis(500), 0).await.unwrap();
+    alice.add_invite(&invite, &pool, 1).await.unwrap();
+    bob.listen_once(&pool, Duration::from_millis(500), 0).await.unwrap();
+
+    // Alice's first send starts WebRTC negotiation (offer via relay
+    // signaling) and falls back to relay delivery for this message.
+    alice.send_text(&bob_id, "first via relay", &pool, 1).await.unwrap();
+    // Bob answers (offer -> answer via signaling), Alice completes ICE.
+    for _ in 0..10 {
+        bob.listen_once(&pool, Duration::from_millis(500), 0).await.unwrap();
+        alice.listen_once(&pool, Duration::from_millis(500), 0).await.unwrap();
+        if alice.webrtc_session_open(&bob_id).await {
+            break;
+        }
+    }
+    assert!(
+        alice.webrtc_session_open(&bob_id).await,
+        "WebRTC data channel should open between the two peers"
+    );
+
+    // The next message goes over the direct data channel.
+    alice
+        .send_text(&bob_id, "second via webrtc", &pool, 1)
+        .await
+        .unwrap();
+    let mut received = false;
+    for _ in 0..10 {
+        let outcome = bob
+            .listen_once(&pool, Duration::from_millis(500), 0)
+            .await
+            .unwrap();
+        if outcome.messages.iter().any(|m| m.text == "second via webrtc") {
+            received = true;
+            break;
+        }
+    }
+    assert!(received, "bob should receive the WebRTC-delivered text");
+}

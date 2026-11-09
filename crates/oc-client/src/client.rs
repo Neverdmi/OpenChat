@@ -17,6 +17,7 @@ use crate::invite::Invite;
 use crate::message::{AckBody, Body, Envelope, TextBody};
 use crate::state::{ClientState, ContactRecord, OutboxRecord, created_now, new_contact};
 use crate::store::StateStore;
+use crate::webrtc::{Signaling, WebRtcSession};
 use crate::{Error, Result};
 
 /// Default number of relays to publish to.
@@ -99,6 +100,10 @@ enum MailboxRef {
         epoch: u32,
         secret: [u8; 32],
     },
+    Signaling {
+        peer_id: [u8; 32],
+        secret: [u8; 32],
+    },
 }
 
 type SubscriptionMap = HashMap<[u8; 32], MailboxRef>;
@@ -123,6 +128,10 @@ pub struct Client {
     store: StateStore,
     /// Last bundle publish (UNIX seconds, session-only throttle).
     last_bundle_publish: u64,
+    /// Whether WebRTC direct delivery is attempted (opt-in).
+    webrtc_enabled: bool,
+    /// Live WebRTC sessions by peer id (session-only, never persisted).
+    webrtc_sessions: HashMap<[u8; 32], WebRtcSession>,
 }
 
 impl core::fmt::Debug for Client {
@@ -143,6 +152,8 @@ impl Client {
             state,
             store,
             last_bundle_publish: 0,
+            webrtc_enabled: false,
+            webrtc_sessions: HashMap::new(),
         })
     }
 
@@ -156,7 +167,30 @@ impl Client {
             state,
             store,
             last_bundle_publish: 0,
+            webrtc_enabled: false,
+            webrtc_sessions: HashMap::new(),
         })
+    }
+
+    /// Enable or disable WebRTC direct delivery (opt-in).
+    pub fn set_webrtc(&mut self, enabled: bool) {
+        self.webrtc_enabled = enabled;
+        if !enabled {
+            self.webrtc_sessions.clear();
+        }
+    }
+
+    /// Whether WebRTC direct delivery is attempted.
+    pub fn is_webrtc(&self) -> bool {
+        self.webrtc_enabled
+    }
+
+    /// Whether a WebRTC data channel to the peer is currently open.
+    pub async fn webrtc_session_open(&self, peer_id: &[u8; 32]) -> bool {
+        match self.webrtc_sessions.get(peer_id) {
+            Some(session) => session.is_open().await,
+            None => false,
+        }
     }
 
     /// Local peer id.
@@ -332,6 +366,20 @@ impl Client {
 
         self.state.enqueue_outbox(record.clone());
         self.save()?;
+
+        // WebRTC direct delivery first (opt-in): if the peer's data
+        // channel is open, the sealed payload goes P2P and never
+        // touches a relay. Otherwise fall back to the relay pool.
+        if self.webrtc_enabled && self.webrtc_send(peer_id, &record, pool).await {
+            self.state.remove_outbox(&record.peer_id, &record.msg_id);
+            self.save()?;
+            return Ok(SentMessage {
+                msg_id,
+                delivered: 1,
+                queued: false,
+            });
+        }
+
         let delivered = self.try_deliver(&record, pool, fanout).await;
         self.save()?;
 
@@ -340,6 +388,83 @@ impl Client {
             delivered,
             queued: delivered == 0,
         })
+    }
+
+    /// Try to deliver one queued record over the peer's WebRTC data
+    /// channel, starting a session (offer) when necessary.
+    /// Returns true when the payload was handed to the channel.
+    async fn webrtc_send(&mut self, peer_id: &[u8; 32], record: &OutboxRecord, pool: &RelayPool) -> bool {
+        if !self.webrtc_sessions.contains_key(peer_id) {
+            let own = match self.state.peer_id() {
+                Ok(own) => own,
+                Err(_) => return false,
+            };
+            match WebRtcSession::new(true, own).await {
+                Ok(session) => {
+                    self.webrtc_sessions.insert(*peer_id, session);
+                }
+                Err(_) => return false,
+            }
+        }
+        // (Re-)offer while no remote description has arrived yet, and
+        // collect gathered ICE candidates. Signaling is published after
+        // the session borrow ends.
+        let mut to_publish: Vec<Signaling> = Vec::new();
+        let open = {
+            let Some(session) = self.webrtc_sessions.get_mut(peer_id) else {
+                return false;
+            };
+            let now = now_unix();
+            if session.needs_offer(now) {
+                match session.offer().await {
+                    Ok(offer) => to_publish.push(offer),
+                    Err(_) => return false,
+                }
+            }
+            to_publish.extend(session.take_outbound());
+            session.is_open().await
+        };
+        for signaling in to_publish {
+            self.publish_signaling(pool, peer_id, &signaling).await;
+        }
+        if !open {
+            return false;
+        }
+        let event = RelayEvent {
+            mailbox: record.mailbox,
+            created_at: record.created_at,
+            expires_at: record.expires_at,
+            payload: record.payload.clone(),
+        };
+        let bytes = match serde_json::to_vec(&event) {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+        match self.webrtc_sessions.get(peer_id) {
+            Some(session) => session.send(bytes).await.is_ok(),
+            None => false,
+        }
+    }
+
+    /// Publish one signaling message to the peer's signaling mailbox.
+    async fn publish_signaling(&self, pool: &RelayPool, peer_id: &[u8; 32], signaling: &Signaling) {
+        let mailbox = mailbox::signaling_mailbox_public(peer_id);
+        let plaintext = match serde_json::to_vec(signaling) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+        let payload = match seal::seal(&mailbox, &plaintext) {
+            Ok(payload) => payload,
+            Err(_) => return,
+        };
+        let now = now_unix();
+        let event = RelayEvent {
+            mailbox,
+            created_at: now,
+            expires_at: now.saturating_add(MESSAGE_TTL_SECONDS),
+            payload,
+        };
+        let _ = pool.publish(&event, DEFAULT_FANOUT).await;
     }
 
     /// Outgoing events still waiting for a relay.
@@ -546,7 +671,7 @@ impl Client {
                             .advance_cursor(event.mailbox, epoch, event.created_at);
                         advanced = true;
 
-                        match self.process_event(&map, &event)? {
+                        match self.process_event(&map, &event).await? {
                             Processed::Ignored => {}
                             Processed::Message(message) => {
                                 let target = (message.peer_id, message.msg_id);
@@ -579,12 +704,85 @@ impl Client {
             self.save()?;
         }
 
+        // WebRTC pass: publish queued signaling (answers, ICE
+        // candidates) and poll data channels for direct deliveries.
+        if self.webrtc_enabled {
+            self.webrtc_pass(pool, &mut outcome, &mut pending_acks)
+                .await?;
+        }
+
         for (peer_id, msg_id) in pending_acks {
             self.send_ack(&peer_id, &msg_id, pool, DEFAULT_FANOUT)
                 .await?;
         }
 
         Ok(outcome)
+    }
+
+    /// One WebRTC sweep: flush signaling, poll data channels.
+    async fn webrtc_pass(
+        &mut self,
+        pool: &RelayPool,
+        outcome: &mut ListenOutcome,
+        pending_acks: &mut Vec<([u8; 32], [u8; 16])>,
+    ) -> Result<()> {
+        if self.webrtc_sessions.is_empty() {
+            return Ok(());
+        }
+        let (_, map, _) = self.subscriptions()?;
+        let peers: Vec<[u8; 32]> = self.webrtc_sessions.keys().copied().collect();
+        for peer_id in peers {
+            // Flush queued signaling (answers + gathered candidates).
+            let outbound: Vec<Signaling> = match self.webrtc_sessions.get(&peer_id) {
+                Some(session) => session.take_outbound(),
+                None => Vec::new(),
+            };
+            for signaling in outbound {
+                self.publish_signaling(pool, &peer_id, &signaling).await;
+            }
+            // Re-offer when an initiator is still waiting for an answer.
+            let now = now_unix();
+            let needs_offer = self
+                .webrtc_sessions
+                .get(&peer_id)
+                .map(|session| session.needs_offer(now))
+                .unwrap_or(false);
+            if needs_offer {
+                if let Some(session) = self.webrtc_sessions.get_mut(&peer_id) {
+                    if let Ok(offer) = session.offer().await {
+                        self.publish_signaling(pool, &peer_id, &offer).await;
+                    }
+                }
+            }
+            // Poll the data channel for direct deliveries.
+            let incoming = match self.webrtc_sessions.get(&peer_id) {
+                Some(session) => {
+                    session
+                        .poll_message(Duration::from_millis(10))
+                        .await
+                }
+                None => None,
+            };
+            if let Some(bytes) = incoming {
+                if let Ok(event) = serde_json::from_slice::<RelayEvent>(&bytes) {
+                    match self.process_event(&map, &event).await? {
+                        Processed::Ignored => {}
+                        Processed::Message(message) => {
+                            let target = (message.peer_id, message.msg_id);
+                            if !pending_acks.contains(&target) {
+                                pending_acks.push(target);
+                            }
+                            outcome.messages.push(message);
+                        }
+                        Processed::Ack(ack) => outcome.acks.push(ack),
+                        Processed::ContactAdded(peer_id) => {
+                            outcome.added_contacts.push(peer_id);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Encrypt and queue a delivery acknowledgement.
@@ -644,6 +842,19 @@ impl Client {
             }
         }
 
+        // WebRTC signaling mailbox (opt-in): our own mailbox, signaling
+        // from any contact arrives here; the sender is inside the
+        // sealed signaling message.
+        if self.webrtc_enabled {
+            map.insert(
+                mailbox::signaling_mailbox_public(&me),
+                MailboxRef::Signaling {
+                    peer_id: me,
+                    secret: mailbox::signaling_mailbox_secret(&me),
+                },
+            );
+        }
+
         // Replay only what may have been produced after a mailbox or session
         // existed, then from the newest cursor for mailboxes already seen.
         // Using the minimum across mailboxes is required because the relay's
@@ -652,6 +863,11 @@ impl Client {
         for (mailbox, reference) in &map {
             let floor = match reference {
                 MailboxRef::Handshake { created_at, .. } => *created_at,
+                MailboxRef::Signaling { peer_id, .. } => self
+                    .state
+                    .contact(peer_id)
+                    .map(|contact| contact.created_at)
+                    .unwrap_or(0),
                 MailboxRef::Inbox { epoch, peer_id, .. } => {
                     let epoch_start = u64::from(*epoch) * mailbox::EPOCH_SECONDS;
                     let contact_start = self
@@ -676,7 +892,7 @@ impl Client {
         Ok((mailboxes, map, resume))
     }
 
-    fn process_event(
+    async fn process_event(
         &mut self,
         map: &HashMap<[u8; 32], MailboxRef>,
         event: &RelayEvent,
@@ -688,8 +904,57 @@ impl Client {
             Some(MailboxRef::Inbox {
                 peer_id, secret, ..
             }) => self.process_text(&peer_id, &secret, &event.payload),
+            Some(MailboxRef::Signaling { peer_id, secret }) => {
+                self.process_signaling(&peer_id, &secret, &event.payload).await
+            }
             None => Ok(Processed::Ignored),
         }
+    }
+
+    /// Handle one WebRTC signaling payload sealed to our signaling mailbox.
+    async fn process_signaling(
+        &mut self,
+        peer_id: &[u8; 32],
+        secret: &[u8; 32],
+        payload: &[u8],
+    ) -> Result<Processed> {
+        if !self.webrtc_enabled {
+            return Ok(Processed::Ignored);
+        }
+        let plaintext = match seal::open(secret, payload) {
+            Ok(plaintext) => plaintext,
+            Err(_) => return Ok(Processed::Ignored),
+        };
+        let signaling: Signaling = match serde_json::from_slice(&plaintext) {
+            Ok(signaling) => signaling,
+            Err(_) => return Ok(Processed::Ignored),
+        };
+        // `peer_id` here is our own id (the mailbox owner); the actual
+        // sender is stamped inside the signaling message.
+        let sender = signaling.from();
+        if sender == *peer_id {
+            return Ok(Processed::Ignored);
+        }
+        // Responder sessions are created on demand.
+        if !self.webrtc_sessions.contains_key(&sender) {
+            let own = match self.state.peer_id() {
+                Ok(own) => own,
+                Err(_) => return Ok(Processed::Ignored),
+            };
+            match WebRtcSession::new(false, own).await {
+                Ok(session) => {
+                    self.webrtc_sessions.insert(sender, session);
+                }
+                Err(_) => return Ok(Processed::Ignored),
+            }
+        }
+        let Some(session) = self.webrtc_sessions.get_mut(&sender) else {
+            return Ok(Processed::Ignored);
+        };
+        if let Ok(Some(response)) = session.apply(&signaling).await {
+            session.push_outbound(response);
+        }
+        Ok(Processed::Ignored)
     }
 
     fn process_handshake(

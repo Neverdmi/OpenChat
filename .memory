@@ -2,9 +2,9 @@
 
 Обновлено: 2026-11-09
 Ветка: `main`
-Версия: 0.1.23 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.24)
+Версия: 0.1.24 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.25)
 Статус: P4 почти готов (свой релей не развёрнут; default.json заполнен публичными MQTT-брокерами); P5 — CLI и TUI готовы (GUI удалён), осталась упаковка
-Тестов: 97 (+15 oc-tui, вне default-members)
+Тестов: 100 (+17 oc-tui, вне default-members)
 
 > Этот файл — точка входа для ИИ-агентов. Прочитай его и `SPEC.md`
 > перед любыми изменениями. После каждого завершённого этапа обновляй
@@ -130,6 +130,11 @@ openchat/
 - `client.rs` — `Client::{create,open,invite,add_invite,send_text,listen_once,
   flush_outbox}`. `send_text`/`add_invite` кладут событие в outbox **до**
   публикации; `listen_once` ретраит должное, расшифровывает и шлёт ACK.
+- `webrtc.rs` — WebRTC DataChannel (opt-in, настройка `webrtc`):
+  signaling через signaling-mailbox (`HKDF(peer_id,
+  "openchat/webrtc-signaling/v1")`, SPEC §9.5), ICE/STUN гугл,
+  прямая доставка sealed-payload'ов P2P с fallback на релеи.
+  E2E-тест: канал открывается между двумя клиентами.
 - `state.rs` — `OutboxRecord` (sealed payload + backoff), последние 4096
   ACK (`peer_id || msg_id`), per-mailbox курсоры `CursorRecord`,
   `RetiredPrekey` (до 2 старых SPK/PQ).
@@ -163,7 +168,8 @@ openchat/
   `word-word-word-word-1234`), контакты, переписка, invite-панель
   (`/invite`, C — копия OSC52, Esc), меню `/settings`.
 - Настройки в `<home>/settings.json` (не секреты): Tor-режим, мосты
-  вкл/выкл, fanout, invite при старте. Смена → перезапуск воркера.
+  вкл/выкл, fanout, invite при старте, WebRTC вкл/выкл (по умолчанию
+  выкл.). Смена → перезапуск воркера.
   Tor встроенный (`arti-client`, rustls): bootstrap в процессе +
   SOCKS5 на 127.0.0.1:9050 поверх `TorClient::connect`; внешних
   программ не нужно. Мосты (obfs4 ×2 + webtunnel ×2, в `tor.rs`)
@@ -225,7 +231,7 @@ cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Ожидаемо: 97 тестов. Ручная проверка релея:
+Ожидаемо: 100 тестов. Ручная проверка релея:
 
 ```bash
 cargo run -p oc-relay -- --listen 127.0.0.1:8080

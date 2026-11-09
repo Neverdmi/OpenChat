@@ -272,7 +272,7 @@ kind=2  text:      payload = header(40) || ratchet_ciphertext
 |---|---|---|
 | 1 | Свои/курируемые релеи (WebSocket/TLS 443) | основной; текст маленький, store-and-forward идеален |
 | 2 | Публичные релеи, добавленные пользователем | расширение пула |
-| 3 | WebRTC DataChannel через публичный STUN | P2P, когда оба онлайн; релей не видит трафик |
+| 3 | WebRTC DataChannel через публичный STUN | P2P, когда оба онлайн; релей не видит трафик; opt-in (см. §9.5) |
 | 4 | Публичные MQTT-брокеры (WSS) | другой пул доменов/ASN, камуфляж под IoT |
 | 5 | XMPP / Matrix (WSS) | третья экосистема |
 | 6 | Tor (`arti`) | `fallback` или `always`; `.onion`-релеи |
@@ -296,6 +296,22 @@ kind=2  text:      payload = header(40) || ratchet_ciphertext
   журнала пересылки на ящик, поэтому MQTT — только live-доставка, а
   офлайн-отправку обеспечивает outbox клиента. Публикацию можно делать
   только на брокер, где разрешён анонимный доступ и топики такого вида.
+
+### 9.5 WebRTC-носитель (opt-in)
+
+Прямой P2P-канал между двумя онлайн-клиентами поверх WebRTC
+DataChannel (`webrtc-rs`, STUN `stun.l.google.com:19302`):
+
+- Сигналинг (SDP offer/answer, ICE-кандидаты) идёт через обычные релеи
+  на **signaling-mailbox** (`HKDF(peer_id, "openchat/webrtc-signaling/v1")`,
+  sealed, отправитель внутри сообщения). Сигналинг — live-only, как MQTT.
+- После открытия канала зашифрованные payload'ы ящиков идут напрямую
+  P2P в обход релеев; релей видит только сигналинг. Нет канала —
+  fallback на пул релеев.
+- Включается пунктом настроек «WebRTC direct delivery» (по умолчанию
+  выкл.). Честные компромиссы: нужны оба онлайн одновременно;
+  ICE показывает публичный IP собеседнику и STUN-серверам (релей его
+  не видит); с Tor не сочетается (нужен прямой UDP).
 
 ### 9.2 Политика выбора
 - Отправка: 3–5 случайных релеев из активного пула, успех при ≥1.
@@ -475,7 +491,8 @@ magic(8) || salt(16) || nonce(24) || XChaCha20-Poly1305(JSON state)
 - `/settings` — меню настроек (сохраняются в `<home>/settings.json`,
   не содержит секретов): Tor-режим (`off`/`fallback`/`always`),
   Tor-мосты вкл/выкл (нужны PT-бинарники), fanout публикаций (1–5),
-  показывать ли invite при старте. Смена настроек перезапускает воркер.
+  показывать ли invite при старте, WebRTC direct delivery вкл/выкл
+  (по умолчанию выкл.). Смена настроек перезапускает воркер.
 - Windows: тот же `oc-tui` собирается в exe
   (`--target x86_64-pc-windows-msvc` на Windows-машине) и открывает
   тот же TUI.
@@ -490,7 +507,7 @@ magic(8) || salt(16) || nonce(24) || XChaCha20-Poly1305(JSON state)
 | P1 | `oc-core`: identity, PQ, X3DH, sealed sender, кадры, ящики, ratchet + тесты | готово (25 тестов) |
 | P2 | `oc-transport`: Carrier trait, WebSocket-релей, пул, health-check | готово (41 тест суммарно) |
 | P3 | `oc-client` + CLI: invite → handshake → текст 1:1, offline-доставка | готово (70 тестов суммарно) |
-| P4 | `oc-relay`, default pool, manifest, MQTT/WebRTC-фолбэки | частично: MQTT готов; публичный релей ждёт деплоя, WebRTC — позже |
+| P4 | `oc-relay`, default pool, manifest, MQTT/WebRTC-фолбэки | частично: MQTT и WebRTC (opt-in) готовы; публичный релей ждёт деплоя |
 | P5 | CLI + TUI (`oc-tui`), GUI удалён по решению пользователя, упаковка | частично: интерактивный CLI (`oc chat`) и TUI (создание identity, генерация пароля, invite, чат; `--cli` → CLI) готовы; упаковка и Windows-проверка — позже |
 | P6 | Tor через arti (встроенный), cover-трафик, аудит, mobile | частично: встроенный Tor (arti) + режимы off/fallback/always в настройках готовы (проверен реальный bootstrap); мосты требуют PT-бинарники; cover-трафик/аудит/mobile — позже |
 

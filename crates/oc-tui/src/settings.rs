@@ -25,6 +25,10 @@ pub struct Settings {
     /// (needs `obfs4proxy` + `webtunnel-client` in PATH).
     #[serde(default)]
     pub tor_bridges: bool,
+    /// Attempt WebRTC direct delivery (opt-in; reveals peer IPs to
+    /// each other, needs both sides online).
+    #[serde(default)]
+    pub webrtc: bool,
 }
 
 impl Default for Settings {
@@ -34,6 +38,7 @@ impl Default for Settings {
             fanout: default_fanout(),
             show_invite_on_start: false,
             tor_bridges: false,
+            webrtc: false,
         }
     }
 }
@@ -144,6 +149,7 @@ mod tests {
             fanout: 5,
             show_invite_on_start: true,
             tor_bridges: true,
+            webrtc: true,
         };
         save(&dir, &settings).unwrap();
         let loaded = load(&dir);

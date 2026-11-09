@@ -82,6 +82,21 @@ pub fn bundle_mailbox_public(peer_id: &[u8; 32]) -> [u8; 32] {
     PublicKey::from(&secret).to_bytes()
 }
 
+/// Secret scalar of the WebRTC signaling mailbox for `peer_id`.
+///
+/// Same public-derivation pattern as the bundle mailbox: anyone with
+/// the peer id can address it, only the owner can read it. Carries SDP
+/// offers/answers and ICE candidates (SPEC §9.1, carrier #3).
+pub fn signaling_mailbox_secret(peer_id: &[u8; 32]) -> [u8; 32] {
+    hkdf32(&[], peer_id, b"openchat/webrtc-signaling/v1")
+}
+
+/// Public address of the WebRTC signaling mailbox for `peer_id`.
+pub fn signaling_mailbox_public(peer_id: &[u8; 32]) -> [u8; 32] {
+    let secret = StaticSecret::from(signaling_mailbox_secret(peer_id));
+    PublicKey::from(&secret).to_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

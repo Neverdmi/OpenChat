@@ -121,7 +121,8 @@ fn adjust_setting(app: &mut TuiApp, delta: i32) {
         0 => app.cycle_tor(delta),
         1 => app.toggle_tor_bridges(),
         2 => app.adjust_fanout(delta),
-        _ => app.toggle_invite_on_start(),
+        3 => app.toggle_invite_on_start(),
+        _ => app.toggle_webrtc(),
     }
 }
 
@@ -187,7 +188,7 @@ fn handle_key(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) {
                 app.settings_row = app.settings_row.saturating_sub(1);
             }
             KeyCode::Down => {
-                app.settings_row = (app.settings_row + 1).min(3);
+                app.settings_row = (app.settings_row + 1).min(4);
             }
             KeyCode::Left => adjust_setting(app, -1),
             KeyCode::Right => adjust_setting(app, 1),
@@ -319,6 +320,15 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TuiApp) {
                     "yes"
                 } else {
                     "no"
+                }
+            ),
+            format!(
+                "WebRTC direct delivery: {}{}",
+                if app.settings.webrtc { "yes" } else { "no" },
+                if app.settings.webrtc {
+                    "  (both sides online; peer sees your IP)"
+                } else {
+                    ""
                 }
             ),
         ];

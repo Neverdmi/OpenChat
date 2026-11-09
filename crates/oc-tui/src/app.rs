@@ -559,6 +559,12 @@ impl TuiApp {
         self.settings.tor_bridges = !self.settings.tor_bridges;
         self.apply_settings();
     }
+
+    /// Toggle WebRTC direct delivery (settings menu).
+    pub fn toggle_webrtc(&mut self) {
+        self.settings.webrtc = !self.settings.webrtc;
+        self.apply_settings();
+    }
 }
 
 impl Default for TuiApp {
@@ -635,7 +641,8 @@ fn snapshot(client: &Client) -> UiEvent {
 }
 
 /// Spawn the background thread that owns the `Client` and the pool.
-pub fn spawn_worker(client: Client, home: &std::path::Path, settings: Settings) -> Worker {
+pub fn spawn_worker(mut client: Client, home: &std::path::Path, settings: Settings) -> Worker {
+    client.set_webrtc(settings.webrtc);
     let (command_tx, command_rx) = mpsc::channel::<WorkerCommand>();
     let (event_tx, event_rx) = mpsc::channel::<UiEvent>();
     let home = home.to_path_buf();

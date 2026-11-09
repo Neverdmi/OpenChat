@@ -67,4 +67,8 @@ pub enum Error {
     /// A required random value could not be generated.
     #[error("randomness source failed")]
     Rng,
+
+    /// WebRTC session failure.
+    #[error("webrtc error: {0}")]
+    WebRtc(String),
 }

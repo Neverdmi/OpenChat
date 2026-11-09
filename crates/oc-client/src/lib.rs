@@ -17,6 +17,7 @@ pub mod invite;
 pub mod message;
 pub mod state;
 pub mod store;
+pub mod webrtc;
 
 pub use client::{
     Client, ContactSummary, ListenOutcome, ReceivedAck, ReceivedMessage, SentMessage,

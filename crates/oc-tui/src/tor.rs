@@ -144,7 +144,7 @@ async fn handle_socks_connection(client: TorHandle, mut socket: TcpStream) -> st
     let mut stream = client
         .connect(format!("{host}:{port}"))
         .await
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
 
     // Success reply (IPv4 zero bind address).
     socket
