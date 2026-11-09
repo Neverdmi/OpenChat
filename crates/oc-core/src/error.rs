@@ -55,4 +55,8 @@ pub enum Error {
     /// Too many message keys were skipped.
     #[error("too many skipped messages")]
     TooManySkipped,
+
+    /// A message was replayed after it had already been consumed.
+    #[error("replayed message")]
+    Replay,
 }

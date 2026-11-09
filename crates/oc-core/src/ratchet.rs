@@ -158,6 +158,20 @@ impl core::fmt::Debug for RatchetSnapshot {
     }
 }
 
+/// Rollback snapshot of the mutable ratchet state.
+struct StateBackup {
+    root_key: [u8; 32],
+    self_dh: [u8; 32],
+    self_dh_public: [u8; 32],
+    remote_dh: Option<[u8; 32]>,
+    send_chain: Option<[u8; 32]>,
+    recv_chain: Option<[u8; 32]>,
+    send_count: u32,
+    prev_send_count: u32,
+    recv_count: u32,
+    skipped: BTreeMap<([u8; 32], u32), [u8; 32]>,
+}
+
 /// Per-session Double Ratchet state.
 pub struct Ratchet {
     root_key: [u8; 32],
@@ -338,6 +352,13 @@ impl Ratchet {
     }
 
     /// Decrypt one message.
+    ///
+    /// The AEAD tag authenticates the message, so no ratchet state is
+    /// mutated before it verifies: on any failure the state is restored
+    /// to the pre-decrypt snapshot (libsignal-style rollback). A forged
+    /// or replayed frame therefore cannot desynchronize the session —
+    /// the sealed envelope gives the attacker chosen headers, but not
+    /// valid tags.
     pub fn decrypt(&mut self, header: &Header, wire: &[u8]) -> Result<Vec<u8>> {
         if wire.len() < aead::NONCE_LEN + aead::TAG_LEN {
             return Err(Error::InvalidLength);
@@ -348,10 +369,40 @@ impl Ratchet {
         let ciphertext = &wire[aead::NONCE_LEN..];
         let aad = self.associated_data(header);
 
-        if let Some(message_key) = self.skipped.remove(&(header.dh, header.n)) {
-            return aead::decrypt(&message_key, &nonce, &aad, ciphertext);
+        // Skipped key (out-of-order delivery): try it without consuming
+        // it first; only a successful decrypt removes it.
+        if let Some(message_key) = self.skipped.get(&(header.dh, header.n)).copied() {
+            let plaintext = aead::decrypt(&message_key, &nonce, &aad, ciphertext)?;
+            if let Some(mut used) = self.skipped.remove(&(header.dh, header.n)) {
+                used.zeroize();
+            }
+            return Ok(plaintext);
         }
 
+        // Replay on the current chain: `n` below the receive counter
+        // with no skipped key means this message was already consumed.
+        // Rejecting it here (instead of advancing the chain with the
+        // next key) keeps forged replays from desynchronizing us.
+        if self.remote_dh == Some(header.dh) && header.n < self.recv_count {
+            return Err(Error::Replay);
+        }
+
+        let backup = self.backup();
+        let result = self.decrypt_inner(header, &nonce, ciphertext, &aad);
+        if result.is_err() {
+            self.restore(backup);
+        }
+        result
+    }
+
+    /// Decrypt with state mutation; caller guarantees rollback on error.
+    fn decrypt_inner(
+        &mut self,
+        header: &Header,
+        nonce: &[u8; aead::NONCE_LEN],
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
         if self.remote_dh != Some(header.dh) {
             self.skip_message_keys(header.pn)?;
             self.dh_ratchet(header)?;
@@ -363,7 +414,37 @@ impl Ratchet {
         let message_key = chain.next();
         self.recv_count = self.recv_count.checked_add(1).ok_or(Error::RatchetState)?;
 
-        aead::decrypt(&message_key, &nonce, &aad, ciphertext)
+        aead::decrypt(&message_key, nonce, aad, ciphertext)
+    }
+
+    /// Snapshot of every mutable field, for rollback on decrypt failure.
+    fn backup(&self) -> StateBackup {
+        StateBackup {
+            root_key: self.root_key,
+            self_dh: self.self_dh.to_bytes(),
+            self_dh_public: self.self_dh_public,
+            remote_dh: self.remote_dh,
+            send_chain: self.send_chain.as_ref().map(|chain| chain.key),
+            recv_chain: self.recv_chain.as_ref().map(|chain| chain.key),
+            send_count: self.send_count,
+            prev_send_count: self.prev_send_count,
+            recv_count: self.recv_count,
+            skipped: self.skipped.clone(),
+        }
+    }
+
+    /// Restore a backup taken by [`Ratchet::backup`].
+    fn restore(&mut self, backup: StateBackup) {
+        self.root_key = backup.root_key;
+        self.self_dh = StaticSecret::from(backup.self_dh);
+        self.self_dh_public = backup.self_dh_public;
+        self.remote_dh = backup.remote_dh;
+        self.send_chain = backup.send_chain.map(|key| ChainKey { key });
+        self.recv_chain = backup.recv_chain.map(|key| ChainKey { key });
+        self.send_count = backup.send_count;
+        self.prev_send_count = backup.prev_send_count;
+        self.recv_count = backup.recv_count;
+        self.skipped = backup.skipped;
     }
 
     fn associated_data(&self, header: &Header) -> Vec<u8> {
@@ -504,6 +585,66 @@ mod tests {
         let (h, mut ct) = alice.encrypt(b"secret").unwrap();
         ct[aead::NONCE_LEN + 3] ^= 1;
         assert!(bob.decrypt(&h, &ct).is_err());
+    }
+
+    #[test]
+    fn forged_header_does_not_break_session() {
+        // C1: a forged frame with chosen headers must not mutate state.
+        let (mut alice, mut bob) = pair();
+
+        let (h, ct) = alice.encrypt(b"first").unwrap();
+        assert_eq!(bob.decrypt(&h, &ct).unwrap(), b"first");
+
+        // Forged frame: fresh random dh, plausible pn/n, garbage wire.
+        let forged = Header {
+            dh: random_array::<32>(),
+            pn: 0,
+            n: 1,
+        };
+        assert!(bob.decrypt(&forged, &[0u8; 64]).is_err());
+
+        // The session must still decrypt the next legitimate message.
+        let (h, ct) = alice.encrypt(b"second").unwrap();
+        assert_eq!(bob.decrypt(&h, &ct).unwrap(), b"second");
+    }
+
+    #[test]
+    fn replay_is_rejected_without_desync() {
+        // C2: replaying a consumed message fails and the chain stays put.
+        let (mut alice, mut bob) = pair();
+
+        let (h, ct) = alice.encrypt(b"once").unwrap();
+        assert_eq!(bob.decrypt(&h, &ct).unwrap(), b"once");
+        assert!(matches!(
+            bob.decrypt(&h, &ct),
+            Err(crate::Error::Replay)
+        ));
+
+        let (h, ct) = alice.encrypt(b"twice").unwrap();
+        assert_eq!(bob.decrypt(&h, &ct).unwrap(), b"twice");
+    }
+
+    #[test]
+    fn forged_skipped_copy_does_not_consume_key() {
+        // C2: a tampered copy of a skipped message must not eat the
+        // stored skipped key; the real message still decrypts after.
+        let (mut alice, mut bob) = pair();
+
+        let (h0, c0) = alice.encrypt(b"zero").unwrap();
+        let (h1, c1) = alice.encrypt(b"one").unwrap();
+        let (h2, c2) = alice.encrypt(b"two").unwrap();
+
+        // Deliver out of order: #2 first skips #0 and #1.
+        assert_eq!(bob.decrypt(&h2, &c2).unwrap(), b"two");
+
+        // Forged copy of #0 (tampered ciphertext) must fail...
+        let mut forged = c0.clone();
+        forged[aead::NONCE_LEN + 2] ^= 1;
+        assert!(bob.decrypt(&h0, &forged).is_err());
+
+        // ...and the original #0 (and #1) must still decrypt.
+        assert_eq!(bob.decrypt(&h0, &c0).unwrap(), b"zero");
+        assert_eq!(bob.decrypt(&h1, &c1).unwrap(), b"one");
     }
 
     #[test]
