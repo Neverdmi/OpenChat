@@ -1,0 +1,517 @@
+# Аудит OpenChat (2026-11-09)
+
+**Метод:** ручной построчный разбор всех ~11 243 строк (`oc-core`, `oc-transport`,
+`oc-relay`, `oc-wire`, `oc-client`, `oc-cli`, `oc-tui`, Cargo.toml, `SPEC.md`/`README.md`),
+`cargo test` (100 тестов, все ok), `cargo clippy --all-targets` (чисто, в т.ч. `-p oc-tui`),
+поиск `unsafe`/`TODO`/`todo!`/`unwrap` на вводе от сети. Подозрительные места перепроверены
+по исходникам.
+**Итог:** 7 критических, ~24 высоких, ~30 средних, ~25 низких/инфо; плюс мёртвый код,
+дубль, расхождение с `SPEC.md`. Проверенные «чистые» зоны — в конце.
+
+---
+
+## CRITICAL (P0)
+
+### C1. Ratchet: мутация состояния до AEAD-авторификации, без отката → разрыв сессии
+`crates/oc-core/src/ratchet.rs:341-367` (`decrypt`), `355-366`
+
+`decrypt` делает `skip_message_keys`/`dh_ratchet`/`chain.next()` и только потом
+`aead::decrypt`. Sealed-конверт не аутентифицирован: любой, знающий одноразовый
+`mailbox_pk` (видит релей), шлёт подставной кадр с выбранными `dh/pn/n` — жертва
+ротирует `root_key`, выбрасывает цепочки, генерирует свежие ключи. Все легитимные
+сообщения после этого не расшифровать (нужен новый X3DH). Подтверждено чтением кода.
+**Несение:** `Crypto` | **Фикс:** снапшот состояния перед `skip/dh_ratchet`,
+откат при ошибке `decrypt` (как в libsignal).
+
+### C2. Ratchet: replay/подделка двигает цепочку; удаляется skipped-ключ до проверки
+`crates/oc-core/src/ratchet.rs:351-366`
+
+Главный путь двигает `recv_chain`/`recv_count` до проверки; поддельный повтор с плохим
+тегом съедает ключ легитимного сообщения → десинхронизация `n` на единицу. Путь со
+`skipped` делает `remove` до `decrypt` — атакующий удаляет хранимый ключ поддельной копией.
+**Фикс:** отклонять `n < recv_count && !skipped.contains`; `remove` только после успешной
+расшифровки; откат advances при ошибке (см. C1).
+
+### C3. Relay: неограниченное глобальное хранилище, нет per-IP/глобального лимита → OOM DoS
+`crates/oc-relay/src/lib.rs:52-57,83-93,100-107`
+
+`events: HashMap<[u8;32], Vec<RelayEvent>>` — любой 32-байтный ключ. На ящик 100×64 KiB,
+но числа ящиков нет: цикл `POST /publish`/`WS Publish` со случайными ящиками → сотни ГиБ
+номинальной очереди, OOM, перезапуск, disk-full. Один `RwLock` на запись на всё.
+`cleanup()` раз в 60 с и только по `expires_at`. **Фикс:** `max_total_events/max_mailboxes/
+max_total_bytes`, LRU, per-IP token bucket, отказ 413/429, шарды вместо глобального лока.
+
+### C4. Relay: replay клонирует до 4096×100 событий (≈26 GiB Vec) одним запросом
+`crates/oc-relay/src/lib.rs:29,302-332`
+
+`MAX_MAILBOXES_PER_CONNECTION=4096`, бакет до 100 событий. Один WS-запрос с 4096 ящиками,
+залитыми 64 KiB → многогигабайтная аллокация + `sort_by_key` под read-локом. Отвал по
+одному запросу. **Фикс:** кап `max_replay_events_per_connection` (200–500), стриминг
+чунками, проверка до сбора.
+
+### C5. Relay: WS/JSON без ограничения размера кадра; лимит ящиков проверяется после десериализации
+`crates/oc-wire/src/lib.rs:51-58,158-172`, `crates/oc-relay/src/lib.rs:219-248,172-177`
+
+HTTP (Axum Json, дефолт 2 MiB) до проверки 64 KiB; WS `Message::Text` — без капа
+(15–64 MiB). `Subscribe { mailboxes }` сначала полностью десериализуется в
+`Vec<[u8;32]>` (hex-декодирование), потом `if len >= 4096`. Один кадр с миллионами
+hex-ящиков → сотни МиБ Vec до ветки ошибки. То же для query `?mailboxes=1,2,…` (2 M запятых
+→ 2 M декодирований + sort). **Фикс:** лимит тел WS, `DefaultBodyLimit`, каунт
+инкрементально до sort, отказ > 4096 до аллокации.
+
+### C6. WebRTC-сигналинг: аутентификация отправителя «подписью» не является; сессии не ограничены
+`crates/oc-client/src/webrtc.rs:36-71,251-288`, `crates/oc-client/src/client.rs:960-993`
+
+`Signaling::from` — поле внутри коробки, запечатанной на публичный сигналинговый ящик
+(выводится из `peer_id`). Sealing доказывает получателя, не отправителя: любой с
+`peer_id` шлёт `Offer{from: alice}` — ответчик создаёт сессию для `alice`, отвечает
+SDP/хостовыми кандидатами (утечка локальных IP), плодит `PeerConnection` и
+`pending_candidates`/`outbound` без капов. 10k случайных `from` → истощение RAM/CPU.
+**Фикс:** принимать только от известных контактов (`contact(sender).is_some()`),
+привязка к identity-подписи/ratchet, кап сессий/очередей (напр. 64), лимит SDP.
+
+### C7. `oc-tui --cli` молча обходит Tor, игнорируя `settings.json` → утечка IP
+`crates/oc-tui/src/main.rs:30-56`, `crates/oc-tui/src/app.rs:644-723`, `crates/oc-cli/src/lib.rs:486-491`
+
+TUI прокидывает `TorConfig` в `RelayPool::from_urls_with_tor` и поднимает SOCKS5.
+CLI `build_pool()` зовёт только `from_urls()`. Путь `--cli` не читает настройки,
+нарушает `SPEC.md §11.6` («тот же CLI») и fail-closed для `always`. Пользователь с
+Tor `always`, запустивший `oc-tui --cli chat`, светит реальный IP релею.
+**Фикс:** грузить `TorConfig` из `<home>/settings.json` в CLI или отказывать `--cli`
+при `tor_mode != Off`; задокументировать, что в `oc` Tor нет.
+
+---
+
+## HIGH (P1)
+
+### H1. Нигде нет X25519 contributory-check (low-order ключи → нулевой shared)
+`crates/oc-core/src/x3dh.rs:262-264,283-288`, `seal.rs:21,53`, `ratchet.rs:201-203,411-429`
+
+Все `diffie_hellman(...).to_bytes()` без `was_contributory()`. Малый порядок ключа
+(злой `EK`/`IK`/`eph_pk`/bundle) форсирует shared `0^32` (известен). Спасает от
+MITM/злого пира только привычка; defence-in-depth потеряна.
+**Фикс:** `if !shared.was_contributory() { return Err(InvalidKey) }` во всех местах
+плюс `is_torsion_free()` при парсе.
+
+### H2. Систематический пропуск `zeroize` — нарушение SPEC §13
+`crates/oc-core/src/identity.rs:65-80`, `pq.rs:46-84`, `x3dh.rs:262-319`,
+`ratchet.rs:99-148,201-429`, `seal.rs:21-59`, `mailbox.rs:18-98`, `kdf.rs`, `aead.rs`
+
+Zeroize есть только в `Ratchet::{ChainKey,Drop}`. Все секреты — голые `[u8;32]/Vec`.
+`ml-kem` без фичи `zeroize` — `DecapsulationKey768` никогда не трётся при drop.
+Снапшоты/клоны хранят цепочки и корни в открытом виде (дамп ядра/кучи = расшифровка
+прошлого). В `oc-client` (см. L1/L2): plaintext состояния, клоны секретов подписок
+на каждое событие. **Фикс:** `Zeroizing<…>` на API с секретами, `Drop/ZeroizeOnDrop`
+для `Identity/PrekeyPair/PqPrekeyPair/MailboxChain/RatchetSnapshot/SkippedKey`,
+`ml-kem/zeroize`, трите старых корней/ключей.
+
+### H3. Bundle/Signaling mailbox «секрет» выведен из публичного `peer_id`
+`crates/oc-core/src/mailbox.rs:75-98`
+
+`HKDF(peer_id, …)` — `peer_id` есть в каждом invite. Комментарий «только владелец
+читает» — неверен: любой с invite открывает и подделывает seal. Безвредно для
+подписанного bundle, фатально для WebRTC-сигналинга (§9.5): SDP/ICE читается/подменяется
+всеми с `peer_id`. **Фикс:** не класть секретный сигналинг на этот ящик; выводить из
+секрета сессии/identity.
+
+### H4. Подпись bundle и transcript не совпадают со SPEC §§3–4
+`crates/oc-core/src/x3dh.rs:122-137,323-335`
+
+SPEC: `domain||version||IK_sign||IK_dh||SPK||created_at(8)||pq_len(2)||PQK`;
+код: `domain||IK_sign||IK_dh||SPK||pq_len(u32)||PQK||created_at` (порядок, ширина,
+нет version). Transcript SPEC: без длины; код вставляет `PQ_ct.len() as u32`.
+Внутри себя консистентно, с внешним миром — нет. **Фикс:** выровнять побайтово,
+golden-векторы.
+
+### H5. Ratchet AD отличается от SPEC §5
+`crates/oc-core/src/ratchet.rs:369-375`: код `transcript||"openchat/ratchet/v1"||header`,
+SPEC — `transcript||header`. Та же проблема интеропа. **Фикс:** убрать домен или
+исправить SPEC.
+
+### H6. Manifest: SSRF и downgrade до `http://`/`ws://`/loopback/internal
+`crates/oc-transport/src/relay_list.rs:96-141`, `pool.rs:91-105`
+
+Нет allowlist схем/хостов: `http://169.254.169.254/`, `http://127.0.0.1:2379/`,
+`ws://10.0.0.5:2376/` парсятся и идут как «доверенные». `http://` разрешён
+(открытый текст). Клиент зондирует внутреннюю метаданные сети/интранет.
+**Фикс:** allowlist `https|wss|mqtts|mqtttls` (+`ws` только для явного локального
+флага), запрет userinfo/RFC1918/loopback/link-local, портов вне списка.
+
+### H7. Manifest: `expires_at == 0` = бессрочно; `issued_at` не проверяется → откат/отзыв невозможен
+`crates/oc-transport/src/relay_list.rs:43-115`
+
+Нет монотонности, `version`, sanity `issued_at <= now+skew`. Старый подписанный список
+с отозванным релеем принимается вечно. **Фикс:** требовать `expires_at != 0 && > now`,
+`issued_at <= now+skew && issued_at <= expires_at`, хранить `last_seen_issued_at`,
+`version == 1`.
+
+### H8. Учётные данные MQTT светятся через `Debug`/ошибки/логи
+`crates/oc-transport/src/mqtt.rs:154-157,225-239`, `pool.rs:122-256`, `relay_list.rs:137`
+
+`#[derive(Debug)]` печатает `Url` с `user:pass@`; `health()`/`Error::Url` эхом
+повторяют полный URL. Скрины/лог `oc relays --check` → угон брокерного аккаунта.
+**Фикс:** кастомный `Debug` с редакицей; в логах только scheme+host+port.
+
+### H9. MQTT native-TLS: remaining-length без лимита 4 байт, переполнение `multiplier`
+`crates/oc-transport/src/mqtt.rs:116-151`
+
+Цикл `read_exact` до снятий бита продолжения без капа; `multiplier *= 128` без
+границы (на 64-бит завернётся, в debug — паника). Злой брокер: бесконечные `0x80` →
+бесконечный рост `packet` до OOM. **Фикс:** лимит 4 байта, кап как в `split_packet`.
+
+### H10. SOCKS5: ATYP domain (0x03) сломан; нет общего тайм-аута
+`crates/oc-transport/src/socks5.rs:209-213`, `parse_connect_reply:88-125`
+
+Читается только 4 байта заголовка, потом `parse_connect_reply(&header)` — для
+доменного BND.ADDR нужен `reply[4]`, всегда `UnexpectedEof`. Юнит-тест проходит
+полным пакетом и баг скрывает. Все вызовы после коннекта — без тайм-аута (в отличие
+от MQTT `OP_TIMEOUT`): медленный прокси вешает клиента. **Фикс:** читать ATYP, потом
+len, потом адрес+порт; общий `CONNECT_TIMEOUT`; тест на «голова только».
+
+### H11. MQTT-over-WS: нет капа пейлоада (у TLS-пути есть) → OOM от злого брокера
+`crates/oc-transport/src/mqtt.rs:52,101-141,569`
+
+`read_tls_packet` режет `>MAX_PAYLOAD=1MiB`; `Conn::Ws` возвращает целый
+`Binary(data)` без проверки (tungstenite до 64 MiB default). **Фикс:** проверка
+`data.len()` до `to_vec()`, тот же 1 MiB, обрыв потока.
+
+### H12. Tor `Fallback` — fail-open по дизайну, в UI не предупреждено
+`crates/oc-transport/src/socks5.rs:18-26,157-175`
+
+`Fallback` = сначала прямой, Tor только при ошибке → релей/ISP видят IP. Пользователь
+с «fallback, но через Tor» деанонимизируется. **Фикс:** дефолт `Always` при включённом
+Tor, громкое предупреждение для `Fallback`, или инверсия семантики.
+
+### H13. Bootstrap/SOCKS bind падают во всех режимах (вкл. `Fallback`)
+`crates/oc-tui/src/app.rs:681-708`
+
+`Err => { send error; return }` и для `bind` — воркер умирает. Занятый `9050`,
+недоступные директории → `fallback` не работает вовсе; пользователи переключаются на
+`Off` и светят IP. **Фикс:** в `Fallback` — `TorConfig::direct()` + статус,
+`Always` — `return`; повтор с backoff.
+
+### H14. Жёстко закодированные Tor-мосты; webtunnel — в doc-пространстве 2001:db8::/32
+`crates/oc-tui/src/tor.rs:27-32`
+
+2× obfs4 + 2× `webtunnel [2001:db8:…]` — RFC 3849 non-routable = никогда не
+подключится. IP/certs перечисляются скрапингом репозитория; ротации нет (SPEC §9.2:
+«заменять при смерти»). **Фикс:** убрать из релиза или за флагом, грузить из
+подписанного манифеста, исправить IP на реальные.
+
+### H15. PT-бинарники ищутся по PATH и под неверными именами
+`crates/oc-tui/src/tor.rs:58-65`, `README.md`, `SPEC.md §9.2`
+
+Код `CfgPath::new("obfs4"/"webtunnel")`, документация — `obfs4proxy/webtunnel-client`.
+Атакующий кладёт исполняемый `obfs4` раньше в `$PATH` (cwd, /tmp) → RCE при включённых
+мостах. **Фикс:** абсолютные пути с документационными именами, проверка digest,
+или статическая сборка PT.
+
+### H16. Локальный SOCKS5 без аутентификации, фикс-порт, без тайм-аутов/лимитов
+`crates/oc-tui/src/tor.rs:88-156`, `app.rs:683`
+
+`127.0.0.1:9050`, неограниченные задачи, `read_exact` без дедлайна, `copy_bidirectional`
+без предела; hex-парсинг host без скобок для IPv6, `host:port` инъекция через `:`.
+Любой локальный процесс = анонимный прокси; slow-connects жгут FD; занятый порт —
+DoS (см. H13). **Фикс:** случайный порт, токен-авторизация, тайм-ауты/капы,
+валидация host, или штатный stream-API arti вместо SOCKS.
+
+### H17. Пароль и история в TUI — голые `String`, никогда не тротся
+`crates/oc-tui/src/app.rs:201,229,249-271,498-512`, `main.rs:487,507`
+
+CLI использует `Zeroizing<String>`; TUI держит `passphrase/confirm` весь сеанс,
+`finish_start` не чистит, `lines: Vec<ChatLine>` растёт без предела. Дамп/своп/
+`/proc/mem` → пароль + переписка. **Фикс:** `Zeroizing<String>`, чистить после
+`open/create`, кольцо `lines` (500) с zeroize.
+
+### H18. `OPENCHAT_PASSPHRASE` обходит проверку длины, читается детьми
+`crates/oc-cli/src/lib.rs:518-537`
+
+Env-путь: только непустота; интерактивный требует ≥ 8. Env виден PT-детям и
+`/proc/*/environ`. README учит `export OPENCHAT_PASSPHRASE=…`. **Фикс:** длина и на
+env-пути, `remove_var` после чтения, спавн PT с пустым env, не экспортировать в shell.
+
+### H19. Рукопожатие перезаписывает подтверждённый контакт и сбрасывает `verified`
+`crates/oc-client/src/client.rs:1026-1073`
+
+TOFU блокирует только смену ключей. Свежий transcript с теми же ключами → новый
+`ContactRecord { verified:false }`, новые root/ratchet, подписки перестраиваются —
+легитимные сообщения на старый root теряются. Даже честный повторный `add_invite`
+(см. H21) рвёт установленную сессию. **Фикс:** на verified с теми же ключами —
+игнор + алерт; замену только по явному действию; рейт-лимит на unverified.
+
+### H20. Отравление курсора `created_at` релеем → постоянная потеря сообщений
+`crates/oc-client/src/client.rs:684-686`, `state.rs:433-462`
+
+`advance_cursor` пишет сырой `event.created_at` без clamp. Один event с
+`created_at ≈ u64::MAX` → курсор `~MAX` → `since = last-1` вечно отрезает
+легитимные (now_unix) события. **Фикс:** clamp к `now ± skew` или курсор по
+локальному времени приёма.
+
+### H21. `add_invite` — сброс сессии, а не идемпотентный no-op
+`crates/oc-client/src/client.rs:293-358` (vs `1044-1048`)
+
+Каждый вызов (даже тот же invite, те же ключи) — свежий ephemeral/transcript/root
+и перезапись контакта. Нет проверки равенства как на responder-пути.
+**Фикс:** при тех же ключах — вернуть `ContactSummary` без handshake; переключ —
+только по форсу.
+
+### H22. `try_deliver` удаляет запись outbox при `Ok(0)` — тихая потеря
+`crates/oc-client/src/client.rs:592-612` (зависит от семантики `publish`)
+
+`Ok(delivered) => { remove_outbox… }` — если `publish` вернёт `Ok(0)` (никем не
+принято, но без ошибки), кадр исчезает, а `queued` врёт. Backoff-учёт пропускается.
+**Фикс:** `remove` только при `delivered > 0`; `Ok(0)` = отказ (retain + backoff).
+
+### H23. Handshake-ящик общедоступен и без лимитов → flooding контактов/диска/памяти
+`crates/oc-client/src/client.rs:825-838,996-1074`, `state.rs:350-359`
+
+Любой с публичным SPK шлёт handshake'ы; каждый новый transcript = X3DH, ratchet,
+`upsert_contact` (неограниченный `Vec`), `save()` на диск, рестарт подписок.
+Нет рейт-лимита/PoW/allow-листа/капа контактов. **Фикс:** per-peer + глобальный
+рейт-лимит, капы размеров, кап контактов/карантин вместо полных контактов.
+
+### H24. Нет межпроцессной блокировки: два `Client` на один state dir разводят ratchet
+`crates/oc-client/src/store.rs` (весь файл — нет `flock`), `client.rs:152-180`
+
+Два CLI-процесса загружают снапшот, независимо encrypt+rename поверх друг друга.
+Проигравший теряет advances/seen/outbox; обе стороны могут слать с одинаковым
+ratchet-состоянием → переиспользование цепочки, дыры dedup. **Фикс:** `flock(LOCK_EX|LOCK_NB)`
+на время жизни `Client`, fail-fast; монотонный generation counter.
+
+### H25. Outbox: тихая высветленная (silent) эвакуация самого старого сообщения
+`crates/oc-client/src/state.rs:379-392`
+
+При `len >= 1024` — `remove(0)` без сигнала. Заполнение легко (Атака: флуд ACK —
+`send_ack` кладёт записи, пока релеи д.) Ratchet уже продвинут → дыра последовательности;
+при больших эвакуациях — разрыв skip-допусков → нерасшифровка. **Фикс:** раздельная
+ёмкость для ACK/текстов, `OutboxFull` вместо эвакуации, back-pressure.
+
+---
+
+## MEDIUM (P2)
+
+### Крипто/протокол
+- **M-C1.** Нет валидации `created_at` bundle: `x3dh.rs:55-119,254-299` — будущее/0/MAX,
+  stale SPK/PQK играются бесконечно. Проверять `<= now+skew`, 7/14 дней.
+- **M-C2.** Нет привязки `peer_id`/self-handshake/replay-защиты: `x3dh.rs:254-320`.
+  `respond` stateless принимает replay (тот же SK). API: `initiate(expected_peer_id)`,
+  reject self, transcript-кэш у вызывающего.
+- **M-C3.** Skipped-ключи: нет TTL (SPEC §5 «≤1000 и TTL»), поллюция до 1000 при
+  упавшей расшифровке; check размера после вставки: `ratchet.rs:26,172,377-403`.
+  Фикс: коммит после `decrypt`, TTL-эвикт, pre-check до цикла.
+- **M-C4.** Нет максимума входной длины: `seal.rs:40-61`, `aead.rs:35-51`,
+  `ratchet.rs:319-367`, `x3dh.rs:226-248` — произвольные `Vec`. Кап 64 KiB до аллокации.
+- **M-C5.** RNG паникует вместо `Err`: `oc-core/src/lib.rs:32-36` `random_array().expect`,
+  `pq.rs` внутри `ml-kem`. Сделать `Result`, прокинуть.
+- **M-C6.** Слабая валидация парсов: `x3dh.rs:89-119,226-248`, `identity.rs:94-99` —
+  любой `pq_len` (≠1184/1088), любой SPK, low-order dh. Точные длины + torsion.
+- **M-C7.** Safety number: `identity.rs:144-158` — сортировка ed+hash парно;
+  SPEC §3 буквально — непарно. Уточнить SPEC или реализацию.
+- **M-C8.** `u16::try_from(len).unwrap_or(u16::MAX)` тихо транкейтит: `x3dh.rs:73,214,133,332`,
+  `mailbox.rs:66`, `frame.rs:16` — `to_bytes` → `Result`/`assert`.
+- **M-C9.** `mailbox.rs:43-54` — `slot_secret` без `index < 32`; `ratchet.rs:277-314`
+  `from_snapshot`: безграничный `transcript`, no consistency; `lib.rs:39-44`
+  `now_unix().unwrap_or(0)` → epoch 0.
+
+### Транспорт/релей
+- **M-T1.** На реле в нет rate limiting/капа соединений/idle-тайм-аута: `oc-relay/src/lib.rs:129-299`.
+  Тысячи WS, Ping-флуд, вечные идлы → истощение FD. Нужны `tower_governor`/semaphore/heartbeat.
+- **M-T2.** Replay отдаёт просроченные события: `lib.rs:309-323` нет `expires_at > now`
+  в фильтре; `cleanup` раз в 60 с. Добавить в read-путь.
+- **M-T3.** MQTT: нет валидации SUBACK (QoS `0x80`), retained ре играют вечно;
+  per-packet тайм-аут без общего дедлайна — stall: `mqtt.rs:315-573`.
+- **M-T4.** WS/MQTT per-frame тайм-ауты = вечный stall: `client.rs:97-108`, `mqtt.rs:282-403`.
+  Общий дедлайн 30 с + idle 2 пропущенных keepalive.
+- **M-T5.** HTTP publish: 2 MiB JSON до проверки 64 KiB: `lib.rs:172-177`. `DefaultBodyLimit` 128 KiB.
+- **M-T6.** Broadcast lag тихо дропает: `lib.rs:28,96,285-296` — флуд > 1024/с = потеря
+  легитимных без ошибки. Per-mailbox очереди или ошибка при lag.
+- **M-T7.** WS handshake побайтно slowloris + loose 101: `ws.rs:172-215` — до ~часов
+  (8192×15 с); `contains("101")`. `read_until(\r\n\r\n)` + 5 с, точный статус, проверка
+  `Upgrade/Connection`.
+- **M-T8.** `pool.rs:192-339`: `subscribe_many` последовательный (len×15 с), игнор health,
+  reconnect со stale `since` (replay-шторм), детерминированный backoff без джиттера.
+  `futures_unordered`, jitter, `last_seen` в `since`, кап fan-out.
+- **M-T9.** Manifest `urls()` — путь без проверки подписи; канон. JSON хрупкий
+  (порядки полей): `relay_list.rs:78-126`. Переименовать в `unverified_urls` или удалить,
+  pinned canonical spec + векторы.
+- **M-T10.** MQTT creds: `:pass@host` (пустой user) тихо дропает pass: `mqtt.rs:449-469`.
+  `RootCertStore` строится на каждое соединение: `mqtt.rs:265`, `ws.rs:86-92` — кэшировать.
+
+### Клиент
+- **M-L1.** Нет капа длины invite: `invite.rs:80-134` — многомегабайтный паст, двойные копии.
+  Кап 8–16 KiB до аллокации.
+- **M-L2.** Relay-hints инъекция → сбор метаданных (IP, mailbox, граф): `invite.rs:160-175`,
+  `client.rs:346`, `state.rs:472-482` — позволяются `http/ws`, private IP, userinfo;
+  `relays` растёт без предела. Игнор для всего трафика по умолчанию, кап 32, предупреждение.
+- **M-L3.** Bundle-mailbox флуд + обход троттла: `client.rs:943-948,652-656,620-638` —
+  любой seal → немедленная републикация bundle на fanout каждый проход; `since=0`
+  реплей. Валидация схемы запроса, троттл 300 с всегда, окно подписки.
+- **M-L4.** Глобальная dedup-таблица (4096) вымывается одним пиром: `state.rs:361-376,21,25`.
+  Per-peer разделы (напр. 512/пир).
+- **M-L5.** Unknown-mailbox засоряет курсоры (до 8192): `client.rs:680-686`, `state.rs:433-462`.
+  Курсор только для подписочных ящиков.
+- **M-L6.** `verified` ставится до dedup и персистится на дубликатах: `client.rs:1106-1122`.
+  Один replay = вечный «verified» без out-of-band safety number.
+- **M-L7.** Outbox backoff без джиттера; `flush_outbox(only_due=false)` игнорит
+  `next_attempt_at` и всё равно `attempts++`: `client.rs:490-540,651`. Рейт-лимит
+  форсированного flush, full jitter, не мутировать attempts.
+- **M-L8.** Symlink-TOCTOU на `state.enc.tmp`: `store.rs:156-188` — предсказуемый путь,
+  `create+truncate` по ссылке, нет `fsync`. `O_CREAT|O_EXCL|O_NOFOLLOW`, random suffix,
+  `fchmod 0600`, `fsync` файл+директор, `renameat2(RENAME_EXCHANGE)`.
+- **M-L9.** Пробелы валидации состояния после decrypt: `state.rs:485-513` — нет капов
+  размеров, ревалидации URL, пересчёта safety number, проверки ratchet/`slot_mask`,
+  дублей `peer_id`. `#[serde(deny_unknown_fields)]`.
+- **M-L10.** Message/signaling JSON без размерных границ: `message.rs:252-263`,
+  `client.rs:964,781` — `MAX_ENVELOPE_LEN` 64 KiB до парса.
+- **M-L11.** SDP `url` от атакующего → ICE на его STUN/TURN (утечка IP): `webrtc.rs:52-59,264-276`.
+  Игнорировать `url` с провода (только хардкод STUN allow-list).
+- **M-L12.** `TextBody::timestamp_ms` неаутентифицирован: `message.rs:31-35`, `client.rs:1128`.
+  Показывать локальное время приёма; clamp `±1 day`.
+
+### CLI/TUI
+- **M-U1.** `settings.json` молча сбрасывается к `TorMode=Off`: `settings.rs:93-108`
+  (`unwrap_or_default` на любую ошибку), запись неатомарна, без 0600. Ошибка = жёсткий
+  отказ, а не downgrade; tmp+rename, 0600, кламп fanout 1–5.
+- **M-U2.** Терминальная escape-инъекция через текст пира (ANSI/OSC52/OSC8/bidi):
+  `oc-cli/src/lib.rs:439-453`, `oc-tui/src/main.rs:387-408`, `app.rs:395-421`.
+  Стрипать C0/C1/ESC, тест-векторы с пейлоадами.
+- **M-U3.** OSC52 копия invite без гигиены, не очищается при выходе: `main.rs:88-99,206-210`.
+  Очистка на quit, подтверждение, не эмитить при не-TTY, короткий invite по умолчанию.
+- **M-U4.** TUI показывает короткий invite (тело обещает полный): `app.rs:634`.
+  Вызывать `invite_full()` или оба; поправить README/SPEC.
+- **M-U5.** CLI `fanout` без парсера (0 / 999999): `oc-cli/src/lib.rs:58-116`.
+  `value_parser!(usize).range(1..=5)` везде.
+- **M-U6.** `--home`/`OPENCHAT_HOME`: нет валидации (пустой → CWD, symlink/«..»);
+  дубль env-обработки с clap: `oc-cli/src/lib.rs:21-30,455-484`. Require absolute,
+  refuse symlink, 0700 на parent.
+- **M-U7.** Invite relay hints молча в пул: `oc-cli/src/lib.rs:172-179`, `app.rs:747-756`.
+  Показывать и спрашивать.
+- **M-U8.** `expect()` на tokio-runtime + `let _ = events.send()` → паники/истекающие воркеры:
+  `app.rs:649-788`. `Result` как `UiEvent::Error`, проверка `send().is_err()`, join.
+- **M-U9.** Гонка рестарта на порту 9050: `app.rs:516-532,728-732` — abort async +
+  немедленный bind. Join перед новым воркером или ephemeral-порт.
+- **M-U10.** `protocol.parse().unwrap()`: `tor.rs:61`; SOCKS-хендлер без тайм-аутов.
+  `unwrap_or_else(return Err())`, 5 с на чтение, кап соединений.
+- **M-U11.** `--cli` детектируется по любому `"--cli"` в argv: `main.rs:29-43`.
+  Только `argv[1]`/clap.
+- **M-U12.** Утечка путей/URL/инвайтов в ошибках: `oc-cli/src/main.rs:4-7`,
+  `oc-tui/src/app.rs:466-785` (`{:#}` с `path_in`, tor bootstrap, invite). Редактировать,
+  короткие пути `~/.openchat/state.enc` в UI.
+
+---
+
+## LOW / INFO (P3)
+
+- **L1.** Plaintext состояния не тротся (`store.rs:141-145`) — zeroize после сериализации.
+- **L2.** Секреты подписок клонируются на каждое событие (`client.rs:835-924`) — стабильные
+  хендлы + `ZeroizeOnDrop`.
+- **L3.** `store.rs:65-72` и `oc-cli/lib.rs:456-468` TOCTOU `exists()`→`create`. `O_EXCL`.
+- **L4.** Argon2id m=19 MiB/t=2 — старая норма OWASP; поднять до 32–64 MiB, t=3,
+  версию параметров в заголовок.
+- **L5.** Не-константное сравнение TOFU/dedup (`state.rs`, `client.rs`) — теоретически,
+  отметить; `subtle::ConstantTimeEq`.
+- **L6.** Только `epoch..epoch+1` подписки; часы назад — потеря (`client.rs:844`) — `epoch-1..+1`,
+  политика skew.
+- **L7.** Throttle по wall-clock замирает при откате часов (`client.rs:622`, `webrtc.rs:349`) —
+  монотонные `Instant`.
+- **L8.** `send_ack` с `?` абортит весь проход (`client.rs:651,730`) — per-ack ошибки без аборта.
+- **L9.** TOFU-handshake абортит проход (`client.rs:1030`) — вернуть `Ignored` + лог.
+- **L10.** `UnknownContact` абортит проход (`client.rs:1091,1113`) — `Ignored`.
+- **L11.** Отправитель маркирует себе `seen` (`state.rs:581-590`) — лучше per-peer-side only.
+- **L12.** `expect("length checked")` на парс-путях (`message.rs:120,188`) → `Err`.
+- **L13.** Снисходительный парс invite (`invite.rs:83-106`) — строго по форме.
+- **L14.** `wrapping_add(1)` эпох (`client.rs:844`) — range-check.
+- **L15.** Мёртвый/недостижимый: `pick_slot` fallback (`client.rs:1213-1238`) — недостижим;
+  `sdp_type_offer` только тест (`webrtc.rs:356`).
+- **L16.** `state.rs:516-520` `safety_number()` пересчитывает вместо сохранённого — дрейф.
+- **L17.** `DEFAULT_FANOUT=3` хардкод для ack/bundle vs пользовательский для текстов
+  (`client.rs:651`) — пробросить fanout.
+- **L18.** TUI: Tab-циклинг на Unlock, `"*".repeat(chars)` течёт длиной + unbounded на paste
+  (`main.rs:149,487`) — фикс 16 `*`, кап 256.
+- **L19.** `oc-cli` tokio `macros` не используется; `oc-tui` не хватает `io-util/net`,
+  `time` может быть лишним (`Cargo.toml`). Выровнять фичи (`cargo tree -e features`).
+- **L20.** Supply chain: 653 крейта в `Cargo.lock`, dual rustls providers (ring+aws-lc
+  через arti + `ring` явно), `panic="abort"`+`strip="symbols"` мешают форензике.
+  `cargo audit`/`deny` в CI.
+- **L21.** `.gitignore`: нет `settings.json`, `tor-arti-*/`, `.openchat/`; `AGENTS.md`
+  требует автопуш в `main` — рисковально для секретов. Добавить в игнор, PR вместо пуша.
+- **L22.** `oc-tui --home` + `~/.openchat` внутри репо — риск коммита `state.enc`/кэша Tor.
+- **L23.** `pub` в бинарном крейте `oc-tui` (`app.rs:19-242`, `tor.rs`) — `pub(crate)`;
+  нет `#![forbid(unsafe_code)]` в `oc-cli`/`oc-tui` (верен только в lib-crate'ах).
+- **L24.** Нет артефакта `Cargo.lock` по умолчанию? (`Cargo.lock` в git — ок для бинарников,
+  отметить политике).
+
+---
+
+## Мёртвый код, дубль, лишнее
+
+| # | Где | Что | Действие |
+|---|---|---|---|
+| D1 | `oc-core/src/error.rs:44-45` | `Error::Pq(String)` никогда не конструируется (`pq.rs` мапит всё в `InvalidLength`) | удалить вариант |
+| D2 | `oc-core/src/error.rs:39-41` | `Error::Kdf` недостижим (`kdf.rs:18,25` — `expect`) | удалить или прокинуть `Result` |
+| D3 | `oc-transport/src/ws.rs:231-240` | `next_binary` — pub, но внутренне не используется | удалить/`pub(crate)` |
+| D4 | `oc-client/src/client.rs:1213-1238, webrtc.rs:356-358` | `pick_slot` unreachable fallback; `sdp_type_offer` только тест | `#[cfg(test)]`/удалить |
+| D5 | `oc-client/src/state.rs:516-520` | `safety_number()` — дубль пересчёта поверх хранимого | удалить/документировать |
+| D6 | `oc-core/src/identity.rs:10` + `x3dh.rs:16` | `Blake2b256` алиас в двух файлах | вынести в `lib.rs` |
+| D7 | `oc-core/src/mailbox.rs:75-98` | bundle/signaling mailbox — идентичный паттерн | одна функция с параметром info |
+| D8 | `oc-transport`: `ws.rs:86-92` vs `mqtt.rs:263-267` | дубль TLS-конфига (webpki + no client auth) | `tls_config()` в `lib.rs` |
+| D9 | `oc-transport`: `client.rs:16`, `mqtt.rs:46`, `ws.rs:24` | `OP_TIMEOUT=15s` в трёх местах | один `const` |
+| D10 | `oc-transport`: `client.rs:64-82` vs `mqtt.rs:200-223` | дубль сборки WS-URL (уже разъехались) | единый билдер |
+| D11 | `oc-cli/src/lib.rs:539-558` vs `oc-tui/src/app.rs:599-620` | `default_home()`/`format_safety()` скопированы; `parse_chat_line` vs `parse_input` | публичные из `oc-cli`, реюз |
+| D12 | `pool.rs:143-165` | `pick_from`/`pick_indices` рядом-дубли; `fanout.max(1)` сюрприз | объединить, доку |
+| D13 | `oc-cli/Cargo.toml:14` | tokio `macros` не нужен (нет `#[tokio::main/test]` в lib) | убрать |
+| D14 | `oc-tui/Cargo.toml:19` | нет `io-util/net`, есть лишний `time` | выровнять |
+
+---
+
+## Расхождение с SPEC/README
+
+| Утверждение | Код | Вердикт |
+|---|---|---|
+| SPEC §11.1 `reqwest/hyper`, keyring/SQLCipher | только `tokio-tungstenite`/`tokio-rustls`, нет keyring | дрейф — обновить SPEC |
+| SPEC §0/§9.2 «`.onion`-релеи допускаются» | явной onion-обработки нет | непроверено/частично |
+| SPEC §11.4 «атомарно `state.enc.tmp→rename`» | `settings.json` — `fs::write` неатомарно | дрейф |
+| SPEC §11.6 «`/invite` — полная ссылка» | TUI даёт короткую | дрейф (M-U4) |
+| SPEC §11.6 «fanout 1–5» | CLI без клампа | дрейф (M-U5) |
+| SPEC §13 «zeroize всё, только `subtle`» | TUI `String`, системные пропуски, нет `subtle` | дрейф (H2/H17) |
+| SPEC §11.5 команды `/help,/peer,/quit` | + недокументированный `/exit` | мелочь |
+| README «word×4-1234» | код `word×5-1234` (`app.rs:588-597`) | дрейф |
+| README «sqlite, static musl» | sqlite-зависимости нет; PT-бинарники внешние | вводит в заблуждение |
+| README/`.memory` «100 (+17 oc-tui)» | `cargo test` без `--workspace` oc-tui не гоняет | отметить `cargo test --workspace` |
+| SPEC §9.2 «мосты заменять при смерти» | захардкожены, без ротации (H14) | невыполнимо без механики |
+
+---
+
+## Проверено и чисто (не трогать)
+
+- TLS **включён** везде: webpki roots, нет `allow_invalid_certs`, SNI верный.
+- WS accept-key SHA-1(key+GUID), строгое `==`; MQTT топик только из hex mailbox (32 байта),
+  инъекции нет; QoS 1 в обе стороны.
+- SOCKS5 core (кроме H10): greeting `0x05,0x00`, `build_connect_request` кап 255, `REP==0`.
+- Relay: нет IP-логгина (ни в `main`, ни `trace`), `accept()` клампит `created_at/expires_at`,
+  режет payload 64 KiB; wire: hex 32 байта/base64url без паддинга, аккуратные ошибки.
+- Core: `aead`/`kdf`/`frame` (бакеты 256/1024/4096/16384, CSPRNG-паддинг), `verify_strict`
+  Ed25519, `peer_id` домен, длины ML-KEM 1184/1088 — чисты (кроме H/M).
+- Клиент: шифрование состояния (magic+AAD, свежие salt/nonce, Argon2id V0x13, 0600,
+  атомарный rename, zeroize ключа), outbox **до** публикации, backoff без переполнений,
+  TOFU-база, transcript-dedup, bundle верифицируется до использования, Debug-редактирование
+  секретов, ротация prekey (7 дней/retired ≤ 2).
+- `unsafe`: только `#![forbid(unsafe_code)]` в 5 lib-crate'ах; прямых `unsafe` нет
+  (в `oc-cli`/`oc-tui` атрибут отсутствует — см. L23).
+- Нет `Command::new`/shell-инъекции; нет секретов в логах.
+
+---
+
+## Приоритет фиксов
+
+1. **C1–C2** откат ratchet на неподлинном кадре — иначе любой релей рвёт все сессии.
+2. **C3–C5** капы релея (память/replay/фреймы) — публичный `oc-relay` сейчас нельзя гонять.
+3. **C6** сигналинг только от известных контактов + капы — иначе IP-leak и DoS из коробки.
+4. **H17/H18/H13/H7** пароли/память/Tor/CLI — деанимизация и downgrade из Tor `always` до `Off`.
+5. **H1/H2/H3** contributory/zeroize/ящик из публичного ID — криптографическая база.
+6. **H6/H7** манифест SSRF/откат — иначе фиксированный пул = фиксированная слежка.
+7. **H19–H25** сессии/курсоры/outbox — потери сообщений и саморазрыв.
+8. **H9–H11/H16** MQTT/SOCKS клиенты — OOM/panic от злого брокера/прокси.
+9. Остальные M/L по порядку списка; D1–D14 — шум/дубль.
+10. Дополнить E2E-тестами на каждый пункт C/H (рейкфендлись курсы, `Ok(0)`, эдикты,
+    поддельный сигналинг, флуд bundle, per-peer dedup, конкурентный доступ к state dir).
