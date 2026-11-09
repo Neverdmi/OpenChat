@@ -27,6 +27,10 @@ use crate::{Error, Result};
 
 /// STUN servers for server-reflexive ICE candidates.
 const STUN_SERVERS: &[&str] = &["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"];
+/// Maximum queued signaling messages / candidates per session.
+const MAX_QUEUED: usize = 128;
+/// Maximum SDP text accepted from the peer.
+const MAX_SDP_BYTES: usize = 65_536;
 /// Data channel label.
 const CHANNEL_LABEL: &str = "openchat";
 
@@ -107,11 +111,13 @@ impl PeerConnectionEventHandler for SessionHandler {
             .unwrap_or_else(|_| event.candidate.to_string());
         let url = event.candidate.url.clone();
         if let Ok(mut shared) = self.shared.lock() {
-            shared.outbound.push_back(Signaling::Candidate {
-                from: self.own_peer_id,
-                candidate,
-                url,
-            });
+            if shared.outbound.len() < MAX_QUEUED {
+                shared.outbound.push_back(Signaling::Candidate {
+                    from: self.own_peer_id,
+                    candidate,
+                    url,
+                });
+            }
         }
     }
 
@@ -202,6 +208,13 @@ impl WebRtcSession {
 
     /// Apply a signaling message from the peer.
     pub async fn apply(&mut self, signaling: &Signaling) -> Result<Option<Signaling>> {
+        let sdp_len = match signaling {
+            Signaling::Offer { sdp, .. } | Signaling::Answer { sdp, .. } => sdp.len(),
+            Signaling::Candidate { candidate, .. } => candidate.len(),
+        };
+        if sdp_len > MAX_SDP_BYTES {
+            return Err(Error::WebRtc("signaling payload too large".into()));
+        }
         // Relay replay can redeliver the same offer/answer; applying
         // them twice is a signaling-state error, so ignore duplicates
         // once the remote description is set.
@@ -254,7 +267,9 @@ impl WebRtcSession {
                 if self.remote_set {
                     self.add_candidate(candidate, url.clone()).await?;
                 } else if let Ok(mut shared) = self.shared.lock() {
-                    shared.pending_candidates.push((candidate.clone(), url.clone()));
+                    if shared.pending_candidates.len() < MAX_QUEUED {
+                        shared.pending_candidates.push((candidate.clone(), url.clone()));
+                    }
                 }
                 Ok(None)
             }
@@ -333,7 +348,9 @@ impl WebRtcSession {
     /// Queue a signaling message for publication.
     pub fn push_outbound(&self, signaling: Signaling) {
         if let Ok(mut shared) = self.shared.lock() {
-            shared.outbound.push_back(signaling);
+            if shared.outbound.len() < MAX_QUEUED {
+                shared.outbound.push_back(signaling);
+            }
         }
     }
 

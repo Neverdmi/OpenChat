@@ -142,3 +142,68 @@ async fn pool_publishes_to_a_relay() {
         .expect("relay error");
     assert_eq!(received.payload, b"via-pool");
 }
+
+#[tokio::test]
+async fn global_event_cap_evicts_oldest_mailboxes() {
+    let config = RelayConfig {
+        max_total_events: 10,
+        max_mailboxes: 100,
+        max_total_bytes: 10 * 1024 * 1024,
+        ..RelayConfig::default()
+    };
+    let url = start_relay(config).await;
+    let client = RelayClient::from_url(&url).unwrap();
+
+    // Fill 20 mailboxes with one event each; only the newest 10 survive.
+    for index in 0..20u8 {
+        let mailbox = [index + 1; 32];
+        client
+            .publish(&RelayEvent::new(mailbox, b"data".to_vec(), 3600))
+            .await
+            .unwrap();
+    }
+
+    // The oldest mailbox (1) was evicted; the newest (20) still replays.
+    let mut fresh = client
+        .subscribe(&[1u8; 32], 0)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), fresh.next())
+            .await
+            .is_err(),
+        "oldest mailbox should have been evicted"
+    );
+    let mut fresh = client
+        .subscribe(&[20u8; 32], 0)
+        .await
+        .unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(5), fresh.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("relay error");
+    assert_eq!(received.payload, b"data");
+}
+
+#[tokio::test]
+async fn publish_rate_limit_rejects_flood() {
+    let url = start_relay(RelayConfig::default()).await;
+    let client = RelayClient::from_url(&url).unwrap();
+
+    let mut accepted = 0;
+    for index in 0..200u8 {
+        let mailbox = [index.wrapping_add(1); 32];
+        if client
+            .publish(&RelayEvent::new(mailbox, vec![1u8; 64], 3600))
+            .await
+            .is_ok()
+        {
+            accepted += 1;
+        }
+    }
+    assert!(
+        accepted <= 130,
+        "rate limiter should reject most of the flood (accepted {accepted})"
+    );
+}

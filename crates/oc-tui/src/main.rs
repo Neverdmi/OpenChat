@@ -30,6 +30,26 @@ fn is_cli_mode(argv: &[OsString]) -> bool {
     argv.iter().any(|arg| arg == "--cli")
 }
 
+/// State directory for the `--cli` Tor check: `--home` from argv,
+/// then `OPENCHAT_HOME`, then the CLI default (`~/.openchat`).
+fn home_from_argv(argv: &[OsString]) -> std::path::PathBuf {
+    let mut iter = argv.iter().skip(1).peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "--home" {
+            if let Some(value) = iter.next() {
+                return std::path::PathBuf::from(value);
+            }
+        }
+        if let Some(value) = arg.to_str().and_then(|arg| arg.strip_prefix("--home=")) {
+            return std::path::PathBuf::from(value);
+        }
+    }
+    if let Some(home) = std::env::var_os("OPENCHAT_HOME") {
+        return std::path::PathBuf::from(home);
+    }
+    app::default_home()
+}
+
 /// Build the argv for the CLI entry point: drop `--cli`, keep the rest.
 fn cli_args_from(argv: &[OsString]) -> Vec<OsString> {
     let mut args = vec![OsString::from("oc")];
@@ -50,6 +70,19 @@ fn main() {
 
     let argv: Vec<OsString> = std::env::args_os().collect();
     if is_cli_mode(&argv) {
+        // The CLI path has no Tor support; silently bypassing a
+        // configured Tor mode would leak the real IP (audit C7).
+        // Refuse instead of downgrading.
+        let home = home_from_argv(&argv);
+        let settings = settings::load(&home);
+        if settings.tor_mode != settings::TorModeSetting::Off {
+            eprintln!(
+                "error: tor_mode is {:?} in {} — CLI mode has no Tor support and would leak your IP; use the TUI or set tor_mode to off",
+                settings.tor_mode,
+                settings::path_in(&home).display()
+            );
+            std::process::exit(1);
+        }
         if let Err(error) = oc_cli::run_cli_from(cli_args_from(&argv)) {
             eprintln!("error: {error:#}");
             std::process::exit(1);

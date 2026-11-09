@@ -23,6 +23,18 @@ struct Args {
     /// Maximum opaque payload size, bytes.
     #[arg(long, default_value_t = 65_536)]
     max_payload: usize,
+
+    /// Maximum mailboxes with stored events (global DoS cap).
+    #[arg(long, default_value_t = 50_000)]
+    max_mailboxes: usize,
+
+    /// Maximum stored events across all mailboxes.
+    #[arg(long, default_value_t = 100_000)]
+    max_total_events: usize,
+
+    /// Maximum total stored payload bytes.
+    #[arg(long, default_value_t = 268_435_456)]
+    max_total_bytes: usize,
 }
 
 #[tokio::main]
@@ -32,6 +44,9 @@ async fn main() -> std::io::Result<()> {
         ttl_seconds: args.ttl,
         max_events_per_mailbox: args.max_events,
         max_payload_bytes: args.max_payload,
+        max_mailboxes: args.max_mailboxes,
+        max_total_events: args.max_total_events,
+        max_total_bytes: args.max_total_bytes,
     });
 
     let listener = TcpListener::bind(&args.listen).await?;

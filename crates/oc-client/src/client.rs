@@ -405,6 +405,9 @@ impl Client {
     /// Returns true when the payload was handed to the channel.
     async fn webrtc_send(&mut self, peer_id: &[u8; 32], record: &OutboxRecord, pool: &RelayPool) -> bool {
         if !self.webrtc_sessions.contains_key(peer_id) {
+            if self.webrtc_sessions.len() >= 64 {
+                return false;
+            }
             let own = match self.state.peer_id() {
                 Ok(own) => own,
                 Err(_) => return false,
@@ -971,8 +974,18 @@ impl Client {
         if sender == *peer_id {
             return Ok(Processed::Ignored);
         }
-        // Responder sessions are created on demand.
+        // Signaling is accepted only from known contacts: the sealed
+        // envelope proves the recipient, not the sender, so anyone who
+        // knows a peer id could otherwise spoof offers and harvest
+        // local IPs from our ICE candidates (audit C6).
+        if self.state.contact(&sender).is_none() {
+            return Ok(Processed::Ignored);
+        }
+        // Responder sessions are created on demand (capped).
         if !self.webrtc_sessions.contains_key(&sender) {
+            if self.webrtc_sessions.len() >= 64 {
+                return Ok(Processed::Ignored);
+            }
             let own = match self.state.peer_id() {
                 Ok(own) => own,
                 Err(_) => return Ok(Processed::Ignored),

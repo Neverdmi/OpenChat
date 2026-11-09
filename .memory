@@ -2,9 +2,9 @@
 
 Обновлено: 2026-11-09
 Ветка: `main`
-Версия: 0.1.28 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.29)
+Версия: 0.1.29 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.30)
 Статус: P4 почти готов (свой релей не развёрнут; default.json заполнен публичными MQTT-брокерами); P5 — CLI и TUI готовы (GUI удалён), осталась упаковка
-Тестов: 103 (+17 oc-tui, вне default-members)
+Тестов: 105 (+17 oc-tui, вне default-members)
 
 > 2026-11-09: проведён полный аудит проекта. Все находки (7 CRITICAL, ~24 HIGH,
 > ~30 MEDIUM, ~25 LOW/INFO, мёртвый код/дубль, дрейф SPEC/README) записаны в файл
@@ -79,6 +79,8 @@ openchat/
 - `x3dh.rs` — гибридный X3DH, `PrekeyBundle`/`Initiation` wire format,
   `PrekeyPair` serialization, transcript.
 - `ratchet.rs` — Double Ratchet, `RatchetSnapshot` (serde) + `from_snapshot`.
+  `decrypt` мутирует состояние только после AEAD-верификации
+  (снапшот + откат, аудит C1–C2); replay отклоняется до продвижения цепочки.
 - `seal.rs` — sealed sender (релей не видит отправителя).
 - `mailbox.rs` — 32 одноразовых адреса на сутки + bundle-mailbox
   (деривация из peer id для коротких invite).
@@ -112,10 +114,14 @@ openchat/
 
 ### `oc-relay`
 - Store-and-forward по одноразовым ящикам.
-- Лимиты: TTL 7 дней, 100 событий/ящик, 64 KiB payload.
+- Лимиты: TTL 7 дней, 100 событий/ящик, 64 KiB payload; глобально
+  50k ящиков / 100k событий / 256 MiB (вытеснение самых старых ящиков),
+  replay ≤ 500 событий на подписку, per-IP publish rate limit
+  120/мин, тела ≤ 128 KiB (аудит C3–C5).
 - `POST /publish`, `GET /health`, `WS /ws`.
 - `subscribe` добавляет до 4096 ящиков на соединение и проигрывает stored.
-- Без аккаунтов, без access-log, IP не логируются.
+- Без аккаунтов, без access-log, IP не логируются (только для
+  rate limiting, в память не пишется на диск).
 - Статический musl-бинарник ~1.7 MB.
 
 ### `oc-client`
@@ -142,7 +148,8 @@ openchat/
   signaling через signaling-mailbox (`HKDF(peer_id,
   "openchat/webrtc-signaling/v1")`, SPEC §9.5), ICE/STUN гугл,
   прямая доставка sealed-payload'ов P2P с fallback на релеи.
-  E2E-тест: канал открывается между двумя клиентами.
+  Сигналинг принимается только от известных контактов, сессии и
+  очереди ограничены (аудит C6). E2E-тест: канал открывается.
 - `state.rs` — `OutboxRecord` (sealed payload + backoff), последние 4096
   ACK (`peer_id || msg_id`), per-mailbox курсоры `CursorRecord`,
   `RetiredPrekey` (до 2 старых SPK/PQ).
@@ -239,7 +246,7 @@ cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Ожидаемо: 103 теста. Ручная проверка релея:
+Ожидаемо: 105 тестов. Ручная проверка релея:
 
 ```bash
 cargo run -p oc-relay -- --listen 127.0.0.1:8080
