@@ -46,6 +46,56 @@
 
 ## Сборка
 
+### Что нужно для сборки (пакеты)
+
+Для сборки нужны только **Rust toolchain** и **C-компилятор** (для `ring`
+и прочих C-зависимостей). OpenSSL, sqlite3 и прочие системные библиотеки
+не нужны: TLS — rustls/ring, Tor — arti (pure Rust), sqlite собирается
+статически из исходников (фича `static`).
+
+**Alpine (musl):**
+
+```bash
+apk add build-base curl pkg-config
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustup target add x86_64-unknown-linux-musl
+```
+
+**Debian/Ubuntu (glibc):**
+
+```bash
+sudo apt update && sudo apt install build-essential curl pkg-config
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustup target add x86_64-unknown-linux-gnu
+```
+
+**Fedora/RHEL:**
+
+```bash
+sudo dnf install gcc curl pkg-config
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+```
+
+**Windows:** установи Rustup с [rustup.rs](https://rustup.rs)
+(профиль MSVC) или через `winget install Rustlang.Rustup`, затем
+`rustup target add x86_64-pc-windows-msvc`. Отдельные пакеты не нужны.
+
+**macOS:** `xcode-select --install` (C-компилятор) + Rustup с rustup.rs.
+
+Кросс-сборка gnu-таргета на musl-хосте требует кросс-gcc
+(`x86_64-linux-gnu-gcc`) — на нативной glibc-машине это не нужно,
+там gnu собирается как хостовый таргет.
+
+Рантайм-зависимостей нет: musl-бинарник статический, Tor встроен
+(arti). Опционально, только если включаешь Tor-мосты в настройках:
+бинарники `obfs4proxy` и `webtunnel-client` в PATH
+(Alpine: `apk add obfs4proxy` — если есть в репозитории,
+Debian: `apt install obfs4proxy`; webtunnel-client — с GitHub
+oleganza/LookAtLucky/webtunnel).
+
 Одна программа — `oc-tui` (TUI) с CLI-режимом внутри (`--cli`).
 Собирается одной командой с указанием таргета:
 
