@@ -9,7 +9,7 @@
 
 | Вопрос | Решение |
 |---|---|
-| Tor | Три режима: `off`, `fallback` (прямое соединение, при ошибке — через Tor), `always` (весь трафик через Tor SOCKS5, fail-closed). Реализация: внешний процесс `tor` + собственный SOCKS5-клиент в `oc-transport`; встроенный `arti-client` — позже (см. `.ideas`). `.onion`-релеи допускаются при Tor. |
+| Tor | Три режима: `off`, `fallback` (прямое соединение, при ошибке — через Tor), `always` (весь трафик через Tor SOCKS5, fail-closed). Реализация: встроенный `arti-client` (чистый Rust, без внешнего бинарника) + SOCKS5-сервер поверх него в `oc-tui`; транспорт ходит через SOCKS. `.onion`-релеи допускаются при Tor. |
 | Платформы | Linux `x86_64-unknown-linux-gnu` (glibc), `x86_64-unknown-linux-musl` (статика, работает и на glibc), `aarch64-unknown-linux-gnu`; Windows `x86_64-pc-windows-msvc` — проверить позже. macOS — позже. |
 | Релеи | Встроенный курируемый пул по умолчанию + возможность добавлять/удалять свои. В репозитории есть `oc-relay` — self-hosted релей без логов, чтобы любой мог поднять свой. |
 | PQ | Гибрид `X25519 + ML-KEM-768` с v1. Формат ключей/инвайтов сразу PQ-совместимый, fallback на чистый X25519 только для совместимости со старыми клиентами. |
@@ -306,13 +306,14 @@ kind=2  text:      payload = header(40) || ratchet_ciphertext
   ошибке — через SOCKS5 Tor.
 - Tor `always`: все соединения только через SOCKS5 Tor; если Tor
   недоступен — ошибка, прямого соединения нет (fail-closed).
-- Tor запускается как дочерний процесс `tor` (SOCKS-порт 127.0.0.1:9050,
-  data-dir внутри каталога состояния, torrc генерируется клиентом);
-  без бинарника `tor` режимы fallback/always честно возвращают ошибку.
-- В torrc вшиты публичные мосты (obfs4 ×2, webtunnel ×2) для работы
-  в цензурируемых сетях; нужны pluggable-transport бинарники
-  `obfs4proxy` и `webtunnel-client`. Мосты в публичном репозитории
-  блокируются быстрее — при смерти заменять в коде.
+- Tor — встроенный `arti-client` в процессе `oc-tui`: bootstrap
+  (10–60 c первый раз, дальше кэш директорий в каталоге состояния),
+  SOCKS5 на 127.0.0.1:9050 поверх `TorClient::connect`.
+- Мосты (obfs4 ×2, webtunnel ×2) — опциональный пункт настроек
+  «Tor bridges»: для них нужны pluggable-transport бинарники
+  `obfs4proxy` и `webtunnel-client` (ограничение архитектуры Tor/arti).
+  Мосты в публичном репозитории блокируются быстрее — при смерти
+  заменять в коде (`oc-tui/src/tor.rs`).
 
 ### 9.3 Камуфляж
 - Только стандартный TLS 1.3 (rustls), реальный SNI, обычные WebSocket-фреймы.
@@ -384,7 +385,7 @@ GET  /health
 - Мобильные позже: `uniffi` → Kotlin/Swift.
 - Крипто: `ed25519-dalek`, `x25519-dalek`, `ml-kem`, `chacha20poly1305`, `hkdf`, `sha2`, `blake2`.
 - Транспорт: `tokio`, `tokio-tungstenite`, `rustls`, `reqwest`/`hyper`.
-- Tor: внешний процесс `tor` (SOCKS5) + собственный SOCKS5-клиент; `arti-client` — позже.
+- Tor: `arti-client` (rustls, статическая сборка для musl).
 - Хранилище: зашифрованный файл состояния (XChaCha20-Poly1305), ключ в OS keyring; позже SQLCipher.
 
 ### 11.2 Состав workspace
@@ -473,8 +474,8 @@ magic(8) || salt(16) || nonce(24) || XChaCha20-Poly1305(JSON state)
   на время сессии, как и в CLI.
 - `/settings` — меню настроек (сохраняются в `<home>/settings.json`,
   не содержит секретов): Tor-режим (`off`/`fallback`/`always`),
-  fanout публикаций (1–5), показывать ли invite при старте. Смена
-  настроек перезапускает воркер.
+  Tor-мосты вкл/выкл (нужны PT-бинарники), fanout публикаций (1–5),
+  показывать ли invite при старте. Смена настроек перезапускает воркер.
 - Windows: тот же `oc-tui` собирается в exe
   (`--target x86_64-pc-windows-msvc` на Windows-машине) и открывает
   тот же TUI.
@@ -491,7 +492,7 @@ magic(8) || salt(16) || nonce(24) || XChaCha20-Poly1305(JSON state)
 | P3 | `oc-client` + CLI: invite → handshake → текст 1:1, offline-доставка | готово (70 тестов суммарно) |
 | P4 | `oc-relay`, default pool, manifest, MQTT/WebRTC-фолбэки | частично: MQTT готов; публичный релей ждёт деплоя, WebRTC — позже |
 | P5 | CLI + TUI (`oc-tui`), GUI удалён по решению пользователя, упаковка | частично: интерактивный CLI (`oc chat`) и TUI (создание identity, генерация пароля, invite, чат; `--cli` → CLI) готовы; упаковка и Windows-проверка — позже |
-| P6 | Tor через arti (встроенный), cover-трафик, аудит, mobile | частично: Tor-режимы в настройках + транспорт через внешний `tor` (SOCKS5) готовы; arti — позже |
+| P6 | Tor через arti (встроенный), cover-трафик, аудит, mobile | частично: встроенный Tor (arti) + режимы off/fallback/always в настройках готовы (проверен реальный bootstrap); мосты требуют PT-бинарники; cover-трафик/аудит/mobile — позже |
 
 ---
 

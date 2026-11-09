@@ -156,15 +156,15 @@ OPENCHAT_PASSPHRASE='alice-passphrase' ./target/debug/oc --home /tmp/alice chat 
   в буфер через OSC 52, Esc — закрыть; вручную выделять длинный текст
   не нужно);
 - `/add <invite>` (или вставить `openchat://…`) — добавить контакт;
-- `/settings` — меню настроек: Tor-режим (`off`/`fallback`/`always`,
-  нужен установленный `tor`), fanout, invite при старте;
+- `/settings` — меню настроек: Tor-режим (`off`/`fallback`/`always`),
+  Tor-мосты вкл/выкл, fanout, invite при старте;
 - `/contacts`, `/flush`, `/help`, `/quit`; `Ctrl+C` — выход.
 
-Tor-режим: `always` гонит весь трафик через Tor SOCKS5 и падает
-закрыто (без прямого соединения), если Tor недоступен; `fallback`
-пробует напрямую и только при ошибке идёт через Tor. Нужны бинарники
-`tor` + `obfs4proxy` + `webtunnel-client` в PATH; мосты (obfs4/webtunnel)
-уже вшиты в генерируемый torrc.
+Tor встроен (arti-client, чистый Rust) — внешних программ не нужно.
+`always` гонит весь трафик через Tor и падает закрыто при ошибке
+bootstrap; `fallback` пробует напрямую, при ошибке — через Tor.
+Мосты (obfs4/webtunnel) включаются пункту настроек и требуют
+бинарники `obfs4proxy` + `webtunnel-client` в PATH.
 
 GUI-версия (egui) удалена: TUI оказался удобнее, в одной программе
 остаются только TUI и CLI.

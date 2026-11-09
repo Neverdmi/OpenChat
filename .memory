@@ -2,7 +2,7 @@
 
 Обновлено: 2026-11-09
 Ветка: `main`
-Версия: 0.1.22 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.23)
+Версия: 0.1.23 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.24)
 Статус: P4 почти готов (свой релей не развёрнут; default.json заполнен публичными MQTT-брокерами); P5 — CLI и TUI готовы (GUI удалён), осталась упаковка
 Тестов: 97 (+15 oc-tui, вне default-members)
 
@@ -162,11 +162,15 @@ openchat/
   экран входа в режимах Unlock/Create (F2), генерация пароля (F3,
   `word-word-word-word-1234`), контакты, переписка, invite-панель
   (`/invite`, C — копия OSC52, Esc), меню `/settings`.
-- Настройки в `<home>/settings.json` (не секреты): Tor-режим, fanout,
-  invite при старте. Смена → перезапуск воркера. Tor запускается
-  внешним бинарником `tor` (генерируемый torrc: SOCKS 127.0.0.1:9050,
-  вшитые мосты obfs4 ×2 + webtunnel ×2, data-dir в home); нужны также
-  `obfs4proxy` + `webtunnel-client`. Без бинарников — fail-closed.
+- Настройки в `<home>/settings.json` (не секреты): Tor-режим, мосты
+  вкл/выкл, fanout, invite при старте. Смена → перезапуск воркера.
+  Tor встроенный (`arti-client`, rustls): bootstrap в процессе +
+  SOCKS5 на 127.0.0.1:9050 поверх `TorClient::connect`; внешних
+  программ не нужно. Мосты (obfs4 ×2 + webtunnel ×2, в `tor.rs`)
+  требуют PT-бинарники `obfs4proxy`/`webtunnel-client`. Реальный
+  bootstrap проверен end-to-end через pty.
+- Нужна явная установка rustls-провайдера (`ring`) в `main` oc-tui:
+  arti + oc-transport тянут разные провайдеры, автоподбор падает.
 - Фоновая нить владеет `Client` + `RelayPool` (свой tokio-рантайм);
   UI <-> воркер — `std::sync::mpsc` (`WorkerCommand`/`UiEvent`).
 - `--cli` в argv → CLI-режим через `oc_cli::run_cli_from`.
@@ -183,8 +187,8 @@ openchat/
 - **PQ**: гибрид `X25519 + ML-KEM-768` с v1. Не откладывать: identity-ключи
   и invite-ссылки долгоживущие, retrofit сломает TOFU.
 - **Tor**: режимы `off`, `fallback`, `always` в настройках TUI;
-  реализация — внешний `tor` + SOCKS5 (fail-closed). Встроенный
-  `arti-client` и `.onion`-релеи — позже (см. `.ideas`).
+  реализация — встроенный `arti-client` + SOCKS5 (fail-closed).
+  `.onion`-релеи — позже (см. `.ideas`).
 - **Платформы**: сначала Linux `x86_64-gnu`, `x86_64-musl`,
   `aarch64-gnu` и Windows `x86_64-msvc`. macOS позже.
 - **Релеи**: встроенный курируемый список + пользовательские.

@@ -6,6 +6,7 @@
 
 mod app;
 mod settings;
+mod tor;
 
 use std::ffi::OsString;
 use std::io;
@@ -42,6 +43,11 @@ fn cli_args_from(argv: &[OsString]) -> Vec<OsString> {
 }
 
 fn main() {
+    // Both arti and the transport layer use rustls; with `ring` and
+    // `aws-lc-rs` both compiled in, rustls cannot pick a provider
+    // automatically, so install `ring` explicitly before anything else.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let argv: Vec<OsString> = std::env::args_os().collect();
     if is_cli_mode(&argv) {
         if let Err(error) = oc_cli::run_cli_from(cli_args_from(&argv)) {
@@ -113,7 +119,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::
 fn adjust_setting(app: &mut TuiApp, delta: i32) {
     match app.settings_row {
         0 => app.cycle_tor(delta),
-        1 => app.adjust_fanout(delta),
+        1 => app.toggle_tor_bridges(),
+        2 => app.adjust_fanout(delta),
         _ => app.toggle_invite_on_start(),
     }
 }
@@ -180,7 +187,7 @@ fn handle_key(app: &mut TuiApp, code: KeyCode, modifiers: KeyModifiers) {
                 app.settings_row = app.settings_row.saturating_sub(1);
             }
             KeyCode::Down => {
-                app.settings_row = (app.settings_row + 1).min(2);
+                app.settings_row = (app.settings_row + 1).min(3);
             }
             KeyCode::Left => adjust_setting(app, -1),
             KeyCode::Right => adjust_setting(app, 1),
@@ -290,8 +297,21 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TuiApp) {
         } else {
             "  (needs tor binary installed)".to_string()
         };
+        let bridges_note = if app.settings.tor_bridges {
+            "  (needs obfs4proxy/webtunnel-client)"
+        } else {
+            ""
+        };
         let rows = [
             format!("Tor mode: {tor}{tor_note}"),
+            format!(
+                "Tor bridges (obfs4/webtunnel): {}{bridges_note}",
+                if app.settings.tor_bridges {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ),
             format!("Fanout: {} relay(s) per publish", app.settings.fanout),
             format!(
                 "Show invite on start: {}",
