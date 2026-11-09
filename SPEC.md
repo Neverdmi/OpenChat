@@ -118,7 +118,7 @@ B вычисляет те же DH и деинкапсулирует `PQ_ct`.
 - Аутентификация A — через DH1 (только владелец `IK_dh_A`), B — через `SPK_B`.
 - Гибрид: запись трафика сейчас не даёт расшифровки после появления квантового компьютера.
 - AD (associated data) для всех последующих кадров:
-  `transcript = "openchat/transcript/v1" || IK_sign_A || IK_dh_A || IK_sign_B || IK_dh_B || EK_A || PQ_ct`.
+  `transcript = "openchat/transcript/v1" || IK_sign_A || IK_dh_A || IK_sign_B || IK_dh_B || EK_A || PQ_ct_len(4 LE) || PQ_ct`.
 
 После handshake:
 ```
@@ -182,7 +182,8 @@ wire           = seal(bundle_mailbox, bundle_bytes)
 
 Стандартная схема Signal (KDF_RK / KDF_CK), AEAD — XChaCha20-Poly1305.
 
-- На сообщение: заголовок `(dh_pub, pn, n)` + AEAD с AD = transcript || header.
+- На сообщение: заголовок `(dh_pub, pn, n)` + AEAD с AD =
+  `transcript || "openchat/ratchet/v1" || header`.
 - Пропущенные ключи хранятся ограниченно (≤ 1000) и с TTL.
 - Каждый ответ делает DH-ratchet (пост-компрометационная стойкость).
 - Никаких подписей на сообщениях — денайябилити.

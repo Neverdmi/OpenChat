@@ -10,6 +10,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arti_client::config::{BridgeConfigBuilder, TorClientConfig};
 use arti_client::TorClient;
@@ -27,8 +28,9 @@ pub type TorHandle = Arc<TorClient<PreferredRuntime>>;
 pub const TOR_BRIDGES: &[&str] = &[
     "obfs4 51.38.220.224:24885 54CE8314507E15AD7B5F61DEBA6372E46C2A07EB cert=jr7h5jLJLoot4ufBd+676hitBxRE3a05vcBzjmsavf300vvY+8TfCfWNJYxwr9T5SveJfg iat-mode=0",
     "obfs4 51.161.81.197:65168 AC5FCFC2ACF33D3A800356E05D42BA68A7262AA3 cert=8mosjcVPEi3In4p/E+xGUC5sMSDKxXH2LG2SwkVK37deKnQwV6wPpHP3rRQuty3i3VbiNQ iat-mode=0",
-    "webtunnel [2001:db8:3ce4:c7c7:1316:3072:b8e9:b915]:443 07E8A7DFCA7B76DD0E2F1E8C6C74D9910AAF279E url=https://shenvalleygamers.com/7HxRIWqsmkPOemUcLFTGuPaW ver=0.0.4",
-    "webtunnel [2001:db8:71fb:a9be:f195:7fc:d1fa:3f41]:443 3D87781EE4EA775BFAA72B8F2D09C0BE489B6D71 url=https://104.36.85.19/bunt-senior-bucket ver=0.0.3",
+    // NOTE (audit H14): the previously listed webtunnel bridges used
+    // 2001:db8::/32 documentation addresses and could never connect;
+    // they were removed. Add real webtunnel bridges here when available.
 ];
 
 /// Build the Arti configuration for this client.
@@ -55,11 +57,13 @@ fn build_config(home: &Path, use_bridges: bool) -> Result<TorClientConfig, Strin
                 .map_err(|error| format!("bridge line invalid: {error}"))?;
             builder.bridges().bridges().push(bridge);
         }
-        for protocol in ["obfs4", "webtunnel"] {
+        // Pluggable-transport binaries by their real names (audit H15):
+        // `obfs4proxy` for obfs4, `webtunnel-client` for webtunnel.
+        for (protocol, binary) in [("obfs4", "obfs4proxy"), ("webtunnel", "webtunnel-client")] {
             let mut transport = arti_client::config::pt::TransportConfigBuilder::default();
             transport
                 .protocols(vec![protocol.parse().unwrap()])
-                .path(arti_client::config::CfgPath::new(protocol.to_string()))
+                .path(arti_client::config::CfgPath::new(binary.to_string()))
                 .run_on_startup(true);
             builder.bridges().transports().push(transport);
         }
@@ -84,14 +88,28 @@ pub async fn bootstrap_tor(home: &Path, use_bridges: bool) -> Result<TorHandle, 
         .map_err(|error| format!("tor bootstrap failed: {error}"))
 }
 
+/// Maximum concurrent SOCKS connections (local DoS cap, audit H16).
+const MAX_SOCKS_CONNECTIONS: usize = 64;
+/// Per-connection handshake deadline.
+const SOCKS_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Run the SOCKS5 server loop on an already-bound listener.
 pub async fn run_socks_proxy(client: TorHandle, listener: TcpListener) {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_SOCKS_CONNECTIONS));
     loop {
         match listener.accept().await {
             Ok((socket, _)) => {
+                let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                    continue;
+                };
                 let client = client.clone();
                 tokio::spawn(async move {
-                    let _ = handle_socks_connection(client, socket).await;
+                    let _permit = permit;
+                    let _ = tokio::time::timeout(
+                        SOCKS_TIMEOUT,
+                        handle_socks_connection(client, socket),
+                    )
+                    .await;
                 });
             }
             Err(_) => continue,
@@ -140,9 +158,9 @@ async fn handle_socks_connection(client: TorHandle, mut socket: TcpStream) -> st
     socket.read_exact(&mut port).await?;
     let port = u16::from_be_bytes(port);
 
-    // Connect through Tor.
+    // Connect through Tor (tuple form keeps IPv6 hosts unambiguous).
     let mut stream = client
-        .connect(format!("{host}:{port}"))
+        .connect((host.as_str(), port))
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))?;
 

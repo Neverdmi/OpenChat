@@ -108,8 +108,19 @@ impl RelayManifest {
         verify_signature(public_key, &message, &signature)
             .map_err(|_| Error::Relay("relay manifest signature is invalid".into()))?;
 
-        if self.expires_at != 0 && self.expires_at <= now {
+        // No immortal manifests: `expires_at` is required, in the
+        // future, and after `issued_at` (with clock-skew tolerance).
+        if self.expires_at == 0 || self.expires_at <= now {
             return Err(Error::Relay("relay manifest has expired".into()));
+        }
+        if self.issued_at > now.saturating_add(SKEW_SECONDS) {
+            return Err(Error::Relay("relay manifest issued in the future".into()));
+        }
+        if self.issued_at > self.expires_at {
+            return Err(Error::Relay("relay manifest issued after expiry".into()));
+        }
+        if self.version != 1 {
+            return Err(Error::Relay("unsupported relay manifest version".into()));
         }
         urls_from_entries(&self.relays)
     }
@@ -131,10 +142,68 @@ pub fn parse_relay_list(json: &str) -> Result<Vec<String>> {
     urls_from_entries(&list.relays)
 }
 
+/// Maximum future skew accepted for manifest timestamps.
+const SKEW_SECONDS: u64 = 300;
+
+/// Validate one relay URL against SSRF/downgrade rules (audit H6):
+/// no userinfo, no plaintext schemes except loopback, no private or
+/// link-local hosting.
+fn validate_relay_url(raw: &str) -> Result<()> {
+    let url = Url::parse(raw).map_err(|error| Error::Url(error.to_string()))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::Url("relay URL must not contain credentials".into()));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| Error::Url("relay URL has no host".into()))?;
+    let scheme = url.scheme();
+    let loopback = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    match scheme {
+        "https" | "wss" | "mqtts" | "mqtttls" => {
+            if is_private_host(host) {
+                return Err(Error::Url("relay URL points at a private address".into()));
+            }
+        }
+        "http" | "ws" | "mqtt" => {
+            // Plaintext is only acceptable for explicit local setups.
+            if !loopback {
+                return Err(Error::Url("plaintext relay URLs are only allowed for localhost".into()));
+            }
+        }
+        other => return Err(Error::Url(format!("unsupported relay scheme {other}"))),
+    }
+    Ok(())
+}
+
+/// Whether a host literal is private, link-local or metadata space.
+fn is_private_host(host: &str) -> bool {
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    if ip.is_loopback() {
+        return true;
+    }
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            octets[0] == 10
+                || (octets[0] == 172 && (16..32).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 168)
+                || (octets[0] == 169 && octets[1] == 254)
+                || octets[0] == 0
+        }
+        std::net::IpAddr::V6(ip) => ip.is_unicast_link_local() || ip.is_unique_local(),
+    }
+}
+
 fn urls_from_entries(entries: &[RelayEntry]) -> Result<Vec<String>> {
     let mut urls = Vec::with_capacity(entries.len());
     for entry in entries {
-        Url::parse(&entry.url).map_err(|error| Error::Url(format!("{}: {error}", entry.url)))?;
+        validate_relay_url(&entry.url)?;
         urls.push(entry.url.clone());
     }
     Ok(urls)
@@ -195,6 +264,46 @@ mod tests {
     fn rejects_invalid_urls() {
         let json = r#"{"version":1,"relays":[{"url":"nope"}]}"#;
         assert!(parse_relay_list(json).is_err());
+    }
+
+    #[test]
+    fn rejects_downgrade_and_private_urls() {
+        // Plaintext off-loopback, credentials, private/metadata hosts.
+        for url in [
+            "http://relay.example",
+            "ws://relay.example",
+            "mqtt://relay.example",
+            "https://user:pass@relay.example",
+            "https://10.0.0.5",
+            "https://192.168.1.1",
+            "https://169.254.169.254",
+            "wss://172.16.0.1",
+            "ftp://relay.example",
+        ] {
+            let json = format!(r#"{{"version":1,"relays":[{{"url":"{url}"}}]}}"#);
+            assert!(parse_relay_list(&json).is_err(), "should reject {url}");
+        }
+        // Loopback plaintext (local dev relay) stays allowed.
+        for url in ["http://127.0.0.1:8080", "ws://localhost:8080"] {
+            let json = format!(r#"{{"version":1,"relays":[{{"url":"{url}"}}]}}"#);
+            assert!(parse_relay_list(&json).is_ok(), "should allow {url}");
+        }
+        // Public TLS schemes pass.
+        let json = r#"{"version":1,"relays":[{"url":"mqtts://broker.example:8884/mqtt"}]}"#;
+        assert!(parse_relay_list(json).is_ok());
+    }
+
+    #[test]
+    fn manifest_rejects_immortal_and_future_issued() {
+        let signing_key = Identity::generate();
+        let public_key = signing_key.public().ed_bytes();
+        let mut immortal = RelayManifest::new(1, 100, 0, Vec::new());
+        immortal.sign(&signing_key).unwrap();
+        assert!(immortal.verify(&public_key, 150).is_err());
+
+        let mut future = RelayManifest::new(1, 10_000, 20_000, Vec::new());
+        future.sign(&signing_key).unwrap();
+        assert!(future.verify(&public_key, 150).is_err());
     }
 
     #[test]

@@ -376,19 +376,24 @@ impl ClientState {
     }
 
     /// Queue an outgoing event, replacing an existing record for the same id.
-    pub fn enqueue_outbox(&mut self, record: OutboxRecord) {
+    ///
+    /// A full outbox is an error, never a silent eviction: the ratchet
+    /// has already advanced for queued records, so dropping one would
+    /// punch a hole in the message sequence (audit H25).
+    pub fn enqueue_outbox(&mut self, record: OutboxRecord) -> Result<()> {
         if let Some(existing) = self
             .outbox
             .iter_mut()
             .find(|existing| existing.msg_id == record.msg_id && existing.peer_id == record.peer_id)
         {
             *existing = record;
-            return;
+            return Ok(());
         }
         if self.outbox.len() >= OUTBOX_CAPACITY {
-            self.outbox.remove(0);
+            return Err(Error::State("outbox is full".into()));
         }
         self.outbox.push(record);
+        Ok(())
     }
 
     /// Remove one outgoing event after a relay accepted it.
@@ -430,7 +435,12 @@ impl ClientState {
     }
 
     /// Advance the replay cursor for a mailbox.
+    ///
+    /// The relay-supplied timestamp is clamped to `now + 300s` skew so
+    /// one forged far-future event cannot poison the cursor and
+    /// permanently filter out legitimate events (audit H20).
     pub fn advance_cursor(&mut self, mailbox: [u8; 32], epoch: Option<u32>, created_at: u64) {
+        let created_at = created_at.min(oc_core::now_unix().saturating_add(300));
         if let Some(cursor) = self
             .cursors
             .iter_mut()
@@ -621,8 +631,8 @@ mod tests {
             next_attempt_at: 0,
         };
 
-        state.enqueue_outbox(record.clone());
-        state.enqueue_outbox(record.clone());
+        state.enqueue_outbox(record.clone()).unwrap();
+        state.enqueue_outbox(record.clone()).unwrap();
         assert_eq!(state.outbox.len(), 1);
 
         state.prune_outbox(19);
@@ -630,7 +640,7 @@ mod tests {
         state.prune_outbox(21);
         assert!(state.outbox.is_empty());
 
-        state.enqueue_outbox(record.clone());
+        state.enqueue_outbox(record.clone()).unwrap();
         assert!(state.remove_outbox(&peer, &record.msg_id));
         assert!(!state.remove_outbox(&peer, &record.msg_id));
 

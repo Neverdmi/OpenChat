@@ -57,6 +57,7 @@ impl Header {
             return Err(Error::InvalidLength);
         }
         let dh = bytes[..32].try_into().expect("length checked");
+        crate::check_public_key(&PublicKey::from(dh))?;
         let pn = u32::from_le_bytes(bytes[32..36].try_into().expect("length checked"));
         let n = u32::from_le_bytes(bytes[36..40].try_into().expect("length checked"));
         Ok(Self { dh, pn, n })
@@ -116,6 +117,12 @@ pub struct SkippedKey {
     pub key: [u8; 32],
 }
 
+impl Drop for SkippedKey {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
 /// Serializable snapshot of a [`Ratchet`].
 ///
 /// Contains secret key material. Only write it to encrypted storage.
@@ -155,6 +162,26 @@ impl core::fmt::Debug for RatchetSnapshot {
             .field("skipped", &self.skipped.len())
             .field("remote_dh", &self.remote_dh.map(|_| "<set>"))
             .finish_non_exhaustive()
+    }
+}
+
+impl RatchetSnapshot {
+    /// Scrub all secret key material (audit H2). Callers that hold a
+    /// snapshot must zeroize it when done; `from_snapshot` borrows so
+    /// the snapshot stays owned by the caller.
+    pub fn zeroize(&mut self) {
+        self.root_key.zeroize();
+        self.self_dh.zeroize();
+        if let Some(send_chain) = &mut self.send_chain {
+            send_chain.zeroize();
+        }
+        if let Some(recv_chain) = &mut self.recv_chain {
+            recv_chain.zeroize();
+        }
+        for entry in &mut self.skipped {
+            entry.key.zeroize();
+        }
+        self.transcript.zeroize();
     }
 }
 
@@ -207,17 +234,15 @@ impl Ratchet {
         session_key: &[u8; 32],
         remote_ratchet: &[u8; 32],
         transcript: Vec<u8>,
-    ) -> Self {
+    ) -> Result<Self> {
         let root_key = ratchet_root(session_key);
         let self_dh = StaticSecret::from(random_array::<32>());
         let self_dh_public = PublicKey::from(&self_dh).to_bytes();
 
-        let shared = self_dh
-            .diffie_hellman(&PublicKey::from(*remote_ratchet))
-            .to_bytes();
+        let shared = crate::dh_shared(&self_dh, &PublicKey::from(*remote_ratchet))?;
         let (root_key, send_chain) = kdf_root(&root_key, &shared);
 
-        Self {
+        Ok(Self {
             root_key,
             self_dh,
             self_dh_public,
@@ -230,7 +255,7 @@ impl Ratchet {
             skipped: BTreeMap::new(),
             transcript,
             max_skip: MAX_SKIP,
-        }
+        })
     }
 
     /// Initialize the responding side.
@@ -288,7 +313,10 @@ impl Ratchet {
     }
 
     /// Restore a ratchet from [`Ratchet::snapshot`].
-    pub fn from_snapshot(snapshot: RatchetSnapshot) -> Result<Self> {
+    ///
+    /// Borrows the snapshot so the caller keeps ownership (and can
+    /// zeroize it afterwards, audit H2).
+    pub fn from_snapshot(snapshot: &RatchetSnapshot) -> Result<Self> {
         if snapshot.max_skip == 0 || snapshot.max_skip > MAX_SKIP {
             return Err(Error::RatchetState);
         }
@@ -307,7 +335,7 @@ impl Ratchet {
         }
 
         let mut skipped = BTreeMap::new();
-        for entry in snapshot.skipped {
+        for entry in &snapshot.skipped {
             skipped.insert((entry.dh, entry.n), entry.key);
         }
 
@@ -322,7 +350,7 @@ impl Ratchet {
             prev_send_count: snapshot.prev_send_count,
             recv_count: snapshot.recv_count,
             skipped,
-            transcript: snapshot.transcript,
+            transcript: snapshot.transcript.clone(),
             max_skip: snapshot.max_skip,
         })
     }
@@ -489,10 +517,7 @@ impl Ratchet {
         self.recv_count = 0;
         self.remote_dh = Some(header.dh);
 
-        let shared = self
-            .self_dh
-            .diffie_hellman(&PublicKey::from(header.dh))
-            .to_bytes();
+        let shared = crate::dh_shared(&self.self_dh, &PublicKey::from(header.dh))?;
         let (root_key, recv_chain) = kdf_root(&self.root_key, &shared);
         self.root_key = root_key;
         self.recv_chain = Some(ChainKey { key: recv_chain });
@@ -501,10 +526,7 @@ impl Ratchet {
         self.self_dh_public = PublicKey::from(&new_dh).to_bytes();
         self.self_dh = new_dh;
 
-        let shared = self
-            .self_dh
-            .diffie_hellman(&PublicKey::from(header.dh))
-            .to_bytes();
+        let shared = crate::dh_shared(&self.self_dh, &PublicKey::from(header.dh))?;
         let (root_key, send_chain) = kdf_root(&self.root_key, &shared);
         self.root_key = root_key;
         self.send_chain = Some(ChainKey { key: send_chain });
@@ -539,7 +561,8 @@ mod tests {
 
         let transcript = x3dh::transcript(&initiation, &bob.public());
         let alice_ratchet =
-            Ratchet::new_initiator(&alice_session, &bundle.signed_prekey, transcript.clone());
+            Ratchet::new_initiator(&alice_session, &bundle.signed_prekey, transcript.clone())
+                .unwrap();
 
         let PrekeyPair { signed_prekey, .. } = bob_prekeys;
         let bob_ratchet = Ratchet::new_responder(&bob_session, signed_prekey, transcript);
@@ -666,8 +689,8 @@ mod tests {
         assert_eq!(bob.decrypt(&h, &ct).unwrap(), b"before restart");
 
         // Persist and restore both sides mid-conversation.
-        let mut alice = Ratchet::from_snapshot(alice.snapshot()).unwrap();
-        let mut bob = Ratchet::from_snapshot(bob.snapshot()).unwrap();
+        let mut alice = Ratchet::from_snapshot(&alice.snapshot()).unwrap();
+        let mut bob = Ratchet::from_snapshot(&bob.snapshot()).unwrap();
 
         let (h, ct) = alice.encrypt(b"after restart").unwrap();
         assert_eq!(bob.decrypt(&h, &ct).unwrap(), b"after restart");
@@ -682,7 +705,7 @@ mod tests {
         let mut snapshot = alice.snapshot();
         snapshot.self_dh_public[0] ^= 1;
         assert!(matches!(
-            Ratchet::from_snapshot(snapshot),
+            Ratchet::from_snapshot(&snapshot),
             Err(Error::InvalidKey)
         ));
     }

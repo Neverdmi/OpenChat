@@ -5,6 +5,7 @@
 //! the receiver without any directory lookup.
 
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 use crate::kdf::hkdf32;
 
@@ -22,6 +23,12 @@ pub struct MailboxChain {
 impl core::fmt::Debug for MailboxChain {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("MailboxChain(<redacted>)")
+    }
+}
+
+impl Drop for MailboxChain {
+    fn drop(&mut self) {
+        self.seed.zeroize();
     }
 }
 

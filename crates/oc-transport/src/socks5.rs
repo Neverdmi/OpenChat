@@ -205,12 +205,45 @@ async fn connect_via_socks5(
     let request = build_connect_request(host, port)?;
     socket.write_all(&request).await?;
 
-    // Reply header, then skip the bound address.
+    // Reply: 4-byte header first, then the bound address whose length
+    // depends on ATYP (domain names need a length byte first).
     let mut header = [0u8; 4];
     socket.read_exact(&mut header).await?;
-    let total = parse_connect_reply(&header)?;
-    let mut rest = vec![0u8; total - 4];
+    if header[0] != 0x05 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad SOCKS5 version",
+        ));
+    }
+    if header[1] != 0x00 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format!("SOCKS5 connect refused (code {})", header[1]),
+        ));
+    }
+    let address_len = match header[3] {
+        0x01 => 4,
+        0x03 => {
+            let mut len = [0u8; 1];
+            socket.read_exact(&mut len).await?;
+            1 + len[0] as usize
+        }
+        0x04 => 16,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unknown SOCKS5 address type",
+            ));
+        }
+    };
+    let mut rest = vec![0u8; address_len + 2];
     socket.read_exact(&mut rest).await?;
+
+    // Re-validate the assembled reply through the pure parser.
+    let mut full_reply = header.to_vec();
+    full_reply.extend_from_slice(&rest);
+    let total = parse_connect_reply(&full_reply)?;
+    debug_assert_eq!(total, full_reply.len());
 
     Ok(socket)
 }

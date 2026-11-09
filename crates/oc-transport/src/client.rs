@@ -26,10 +26,21 @@ pub(crate) fn install_crypto_provider() {
 }
 
 /// WebSocket client for one relay.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RelayClient {
     base: Url,
+    /// URL without userinfo, for display (never log credentials).
+    display: Url,
     tor: TorConfig,
+}
+
+impl core::fmt::Debug for RelayClient {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RelayClient")
+            .field("endpoint", &self.display)
+            .field("tor_mode", &self.tor.mode)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RelayClient {
@@ -38,8 +49,10 @@ impl RelayClient {
     /// Both `http(s)://` and `ws(s)://` are accepted.
     pub fn new(base: Url) -> Self {
         install_crypto_provider();
+        let display = crate::mqtt::sanitized(&base);
         Self {
             base,
+            display,
             tor: TorConfig::direct(),
         }
     }
@@ -112,7 +125,7 @@ impl RelayClient {
 #[async_trait]
 impl Carrier for RelayClient {
     fn endpoint(&self) -> &Url {
-        &self.base
+        &self.display
     }
 
     async fn health(&self) -> Result<()> {

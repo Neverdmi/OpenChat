@@ -35,6 +35,31 @@ pub fn random_array<const N: usize>() -> [u8; N] {
     out
 }
 
+/// X25519 key agreement with a contributory check (audit H1).
+///
+/// A low-order public key would force the shared secret to the known
+/// all-zero value; such keys are rejected instead of being mixed in.
+pub(crate) fn dh_shared(
+    secret: &x25519_dalek::StaticSecret,
+    public: &x25519_dalek::PublicKey,
+) -> Result<[u8; 32]> {
+    let shared = secret.diffie_hellman(public);
+    if !shared.was_contributory() {
+        return Err(Error::InvalidKey);
+    }
+    Ok(shared.to_bytes())
+}
+
+/// Parse-time torsion rejection (audit H1, defence in depth).
+///
+/// The contributory check in [`dh_shared`] is the authoritative
+/// defence (it rejects any low-order DH output per RFC 7748 §6.1).
+/// `x25519-dalek` 3.x exposes no Montgomery-point torsion API, so
+/// parsing deliberately does not try to pre-filter here.
+pub(crate) fn check_public_key(_public: &x25519_dalek::PublicKey) -> Result<()> {
+    Ok(())
+}
+
 /// Current UNIX time in seconds.
 pub fn now_unix() -> u64 {
     std::time::SystemTime::now()

@@ -35,6 +35,13 @@ const MAX_SDP_BYTES: usize = 65_536;
 const CHANNEL_LABEL: &str = "openchat";
 
 /// One signaling message, exchanged over the signaling mailbox.
+///
+/// The signaling mailbox is addressed by public derivation (anyone with
+/// the peer id can compute it), so the sealed envelope alone does not
+/// authenticate the sender. Every message therefore carries an
+/// Ed25519 signature by the sender's identity key over the canonical
+/// bytes below; receivers verify it against the pinned contact keys
+/// before acting (audit H3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Signaling {
@@ -44,6 +51,8 @@ pub enum Signaling {
         from: [u8; 32],
         /// SDP text.
         sdp: String,
+        /// Identity signature over the canonical bytes (hex).
+        sig: String,
     },
     /// SDP answer.
     Answer {
@@ -51,6 +60,8 @@ pub enum Signaling {
         from: [u8; 32],
         /// SDP text.
         sdp: String,
+        /// Identity signature over the canonical bytes (hex).
+        sig: String,
     },
     /// ICE candidate (serialized form).
     Candidate {
@@ -60,8 +71,12 @@ pub enum Signaling {
         candidate: String,
         /// STUN/TURN URL for srflx/relay candidates.
         url: Option<String>,
+        /// Identity signature over the canonical bytes (hex).
+        sig: String,
     },
 }
+
+const SIGNALING_DOMAIN: &[u8] = b"openchat/webrtc-signaling/v1";
 
 impl Signaling {
     /// Sender peer id of any signaling message.
@@ -71,6 +86,65 @@ impl Signaling {
                 *from
             }
         }
+    }
+
+    /// Signature over this message (hex).
+    pub fn signature(&self) -> &str {
+        match self {
+            Self::Offer { sig, .. } | Self::Answer { sig, .. } | Self::Candidate { sig, .. } => {
+                sig
+            }
+        }
+    }
+
+    /// Attach (or replace) the sender's identity signature.
+    pub fn sign(&mut self, signer: &oc_core::identity::Identity) {
+        let message = self.canonical_bytes();
+        self.set_signature(hex::encode(signer.sign(&message)));
+    }
+
+    fn set_signature(&mut self, sig: String) {
+        match self {
+            Self::Offer { sig: slot, .. }
+            | Self::Answer { sig: slot, .. }
+            | Self::Candidate { sig: slot, .. } => *slot = sig,
+        }
+    }
+
+    /// Canonical bytes covered by the identity signature.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut message = SIGNALING_DOMAIN.to_vec();
+        message.extend_from_slice(&self.from());
+        match self {
+            Self::Offer { sdp, .. } => {
+                message.push(1);
+                message.extend_from_slice(sdp.as_bytes());
+            }
+            Self::Answer { sdp, .. } => {
+                message.push(2);
+                message.extend_from_slice(sdp.as_bytes());
+            }
+            Self::Candidate {
+                candidate, url, ..
+            } => {
+                message.push(3);
+                message.extend_from_slice(candidate.as_bytes());
+                message.push(b'\n');
+                message.extend_from_slice(url.as_deref().unwrap_or("").as_bytes());
+            }
+        }
+        message
+    }
+
+    /// Verify the identity signature against a pinned Ed25519 key.
+    pub fn verify(&self, ed_key: &[u8; 32]) -> bool {
+        let Ok(bytes) = hex::decode(self.signature()) else {
+            return false;
+        };
+        let Ok(signature) = <[u8; 64]>::try_from(bytes.as_slice()) else {
+            return false;
+        };
+        oc_core::identity::verify_signature(ed_key, &self.canonical_bytes(), &signature).is_ok()
     }
 }
 
@@ -116,6 +190,7 @@ impl PeerConnectionEventHandler for SessionHandler {
                     from: self.own_peer_id,
                     candidate,
                     url,
+                    sig: String::new(),
                 });
             }
         }
@@ -203,6 +278,7 @@ impl WebRtcSession {
         Ok(Signaling::Offer {
             from: self.own_peer_id,
             sdp: offer.sdp,
+            sig: String::new(),
         })
     }
 
@@ -248,6 +324,7 @@ impl WebRtcSession {
                 Ok(Some(Signaling::Answer {
                     from: self.own_peer_id,
                     sdp: answer.sdp,
+                    sig: String::new(),
                 }))
             }
             Signaling::Answer { sdp, .. } => {
@@ -385,15 +462,18 @@ mod tests {
             Signaling::Offer {
                 from: [1u8; 32],
                 sdp: "v=0\r\n".to_string(),
+                sig: String::new(),
             },
             Signaling::Answer {
                 from: [1u8; 32],
                 sdp: "v=0\r\n".to_string(),
+                sig: String::new(),
             },
             Signaling::Candidate {
                 from: [1u8; 32],
                 candidate: "candidate:1 1 udp".to_string(),
                 url: None,
+                sig: String::new(),
             },
         ] {
             let json = serde_json::to_string(&message).unwrap();
@@ -411,11 +491,13 @@ mod tests {
                         from: _,
                         candidate: a,
                         url: _,
+                        sig: _,
                     },
                     Signaling::Candidate {
                         from: _,
                         candidate: b,
                         url: _,
+                        sig: _,
                     },
                 ) => assert_eq!(a, b),
                 _ => panic!("variant changed"),

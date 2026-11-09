@@ -27,6 +27,14 @@ impl core::fmt::Debug for PqPrekeyPair {
     }
 }
 
+impl Drop for PqPrekeyPair {
+    fn drop(&mut self) {
+        // `ml-kem` is built with the `zeroize` feature; its keys are
+        // scrubbed on drop via `ZeroizeOnDrop` (audit H2).
+        let _ = &self.dk;
+    }
+}
+
 impl PqPrekeyPair {
     /// Generate a fresh ML-KEM-768 keypair.
     pub fn generate() -> Self {

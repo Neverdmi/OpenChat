@@ -102,7 +102,13 @@ impl Conn {
         match self {
             Conn::Ws(socket) => loop {
                 match socket.next().await {
-                    Some(Ok(Message::Binary(data))) => return Ok(Some(data.to_vec())),
+                    Some(Ok(Message::Binary(data))) => {
+                        // Cap oversized broker frames (audit H11).
+                        if data.len() > MAX_PAYLOAD {
+                            return Err(Error::Relay("mqtt payload too large".into()));
+                        }
+                        return Ok(Some(data.to_vec()));
+                    }
                     Some(Ok(Message::Close(_))) | None => return Ok(None),
                     Some(Ok(_)) => continue,
                     Some(Err(error)) => return Err(Error::Ws(error)),
@@ -121,11 +127,14 @@ async fn read_tls_packet(socket: &mut TlsSocket) -> Result<Option<Vec<u8>>> {
         Ok(_) => {}
         Err(error) => return Err(Error::Relay(format!("tls read: {error}"))),
     }
-    // Remaining length: 1–4 bytes, 7 bits each, MSB = continuation.
+    // Remaining length: 1–4 bytes, 7 bits each, MSB = continuation
+    // (MQTT spec caps the encoding at 4 bytes; more is a protocol
+    // error, and an unbounded loop would let a malicious broker grow
+    // the packet buffer without limit — audit H9).
     let mut length: usize = 0;
     let mut multiplier: usize = 1;
     let mut packet = vec![first[0]];
-    loop {
+    for _ in 0..4 {
         let mut byte = [0u8; 1];
         socket
             .read_exact(&mut byte)
@@ -137,6 +146,9 @@ async fn read_tls_packet(socket: &mut TlsSocket) -> Result<Option<Vec<u8>>> {
             break;
         }
         multiplier *= 128;
+    }
+    if packet.last().is_some_and(|byte| byte & 0x80 != 0) {
+        return Err(Error::Relay("mqtt remaining length too long".into()));
     }
     if length > MAX_PAYLOAD {
         return Err(Error::Relay("mqtt packet too large".into()));
@@ -151,10 +163,29 @@ async fn read_tls_packet(socket: &mut TlsSocket) -> Result<Option<Vec<u8>>> {
 }
 
 /// MQTT client for one broker endpoint.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MqttClient {
     base: Url,
+    /// URL without userinfo, for display (never log credentials).
+    display: Url,
     tor: TorConfig,
+}
+
+impl core::fmt::Debug for MqttClient {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MqttClient")
+            .field("endpoint", &self.display)
+            .field("tor_mode", &self.tor.mode)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Strip userinfo from a URL for display purposes.
+pub(crate) fn sanitized(url: &Url) -> Url {
+    let mut clone = url.clone();
+    let _ = clone.set_username("");
+    let _ = clone.set_password(None);
+    clone
 }
 
 impl MqttClient {
@@ -169,8 +200,10 @@ impl MqttClient {
         // the WebSocket path installs it too, this keeps MQTT usable
         // on its own.
         crate::client::install_crypto_provider();
+        let display = sanitized(&base);
         Self {
             base,
+            display,
             tor: TorConfig::direct(),
         }
     }
@@ -195,6 +228,11 @@ impl MqttClient {
     /// Base endpoint.
     pub fn url(&self) -> &Url {
         &self.base
+    }
+
+    /// Endpoint for display/diagnostics (credentials stripped).
+    pub fn display_url(&self) -> &Url {
+        &self.display
     }
 
     fn ws_url(&self) -> Result<Url> {
@@ -276,7 +314,7 @@ impl MqttClient {
 #[async_trait]
 impl Carrier for MqttClient {
     fn endpoint(&self) -> &Url {
-        &self.base
+        &self.display
     }
 
     async fn health(&self) -> Result<()> {

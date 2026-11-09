@@ -18,13 +18,13 @@ pub const SEAL_OVERHEAD: usize = 1 + 32 + aead::NONCE_LEN + aead::TAG_LEN;
 pub fn seal(mailbox_pk: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
     let ephemeral = StaticSecret::from(random_array::<32>());
     let ephemeral_pk = PublicKey::from(&ephemeral);
-    let shared = ephemeral.diffie_hellman(&PublicKey::from(*mailbox_pk));
+    let shared = crate::dh_shared(&ephemeral, &PublicKey::from(*mailbox_pk))?;
 
     let mut aad = SEAL_DOMAIN.to_vec();
     aad.extend_from_slice(&ephemeral_pk.to_bytes());
     aad.extend_from_slice(mailbox_pk);
 
-    let key = hkdf32(&[], shared.as_bytes(), &aad);
+    let key = hkdf32(&[], &shared, &aad);
     let nonce = random_array::<{ aead::NONCE_LEN }>();
     let ciphertext = aead::encrypt(&key, &nonce, &aad, plaintext)?;
 
@@ -49,14 +49,16 @@ pub fn open(mailbox_sk: &[u8; 32], wire: &[u8]) -> Result<Vec<u8>> {
     let nonce: [u8; aead::NONCE_LEN] = wire[33..57].try_into().expect("slice length checked");
     let ciphertext = &wire[57..];
 
+    let ephemeral_public = PublicKey::from(ephemeral_pk);
+    crate::check_public_key(&ephemeral_public)?;
     let mailbox_secret = StaticSecret::from(*mailbox_sk);
-    let shared = mailbox_secret.diffie_hellman(&PublicKey::from(ephemeral_pk));
+    let shared = crate::dh_shared(&mailbox_secret, &ephemeral_public)?;
 
     let mut aad = SEAL_DOMAIN.to_vec();
     aad.extend_from_slice(&ephemeral_pk);
     aad.extend_from_slice(&PublicKey::from(&mailbox_secret).to_bytes());
 
-    let key = hkdf32(&[], shared.as_bytes(), &aad);
+    let key = hkdf32(&[], &shared, &aad);
     aead::decrypt(&key, &nonce, &aad, ciphertext)
 }
 

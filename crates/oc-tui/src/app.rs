@@ -197,8 +197,8 @@ pub struct TuiApp {
     pub locked: bool,
     /// Encrypted-state directory (editable on the unlock screen).
     pub home: String,
-    /// Passphrase (editable on the unlock screen).
-    pub passphrase: String,
+    /// Passphrase (editable on the unlock screen). Zeroized on drop.
+    pub passphrase: zeroize::Zeroizing<String>,
     /// Unlock/worker error to show.
     pub error: Option<String>,
     /// Worker handles once unlocked.
@@ -225,8 +225,8 @@ pub struct TuiApp {
     pub lock_field: LockField,
     /// Unlock screen mode (open existing / create new).
     pub lock_mode: LockMode,
-    /// Confirmation of the passphrase (create mode only).
-    pub confirm_passphrase: String,
+    /// Confirmation of the passphrase (create mode only). Zeroized.
+    pub confirm_passphrase: zeroize::Zeroizing<String>,
     /// Whether the full invite link panel is shown.
     pub show_invite: bool,
     /// User settings (loaded from `settings.json` after unlocking).
@@ -247,7 +247,7 @@ impl TuiApp {
         Self {
             locked: true,
             home: default_home().to_string_lossy().into_owned(),
-            passphrase: String::new(),
+            passphrase: zeroize::Zeroizing::new(String::new()),
             error: None,
             worker: None,
             contacts: Vec::new(),
@@ -261,7 +261,7 @@ impl TuiApp {
             focus: Focus::Input,
             lock_field: LockField::Passphrase,
             lock_mode: LockMode::Unlock,
-            confirm_passphrase: String::new(),
+            confirm_passphrase: zeroize::Zeroizing::new(String::new()),
             show_invite: false,
             settings: Settings::default(),
             show_settings: false,
@@ -336,7 +336,7 @@ impl TuiApp {
                         peer,
                         text: text.clone(),
                     });
-                    self.lines.push(ChatLine {
+                    self.push_line(ChatLine {
                         author: "me".to_string(),
                         text,
                         outgoing: true,
@@ -391,24 +391,33 @@ impl TuiApp {
         }
     }
 
+    /// Push a conversation line, capping history at 500 lines (audit H17).
+    pub fn push_line(&mut self, line: ChatLine) {
+        self.lines.push(line);
+        if self.lines.len() > 500 {
+            let excess = self.lines.len() - 500;
+            self.lines.drain(..excess);
+        }
+    }
+
     /// Apply one receive pass: messages, acks and new contacts.
     pub fn apply_outcome(&mut self, outcome: &ListenOutcome) {
         for peer_id in &outcome.added_contacts {
-            self.lines.push(ChatLine {
+            self.push_line(ChatLine {
                 author: "system".to_string(),
                 text: format!("new contact: {}", short_peer_id(peer_id)),
                 outgoing: false,
             });
         }
         for message in &outcome.messages {
-            self.lines.push(ChatLine {
+            self.push_line(ChatLine {
                 author: short_peer_id(&message.peer_id),
                 text: message.text.clone(),
                 outgoing: false,
             });
         }
         for ack in &outcome.acks {
-            self.lines.push(ChatLine {
+            self.push_line(ChatLine {
                 author: "system".to_string(),
                 text: format!(
                     "ack: {} delivered {}",
@@ -439,7 +448,7 @@ impl TuiApp {
         if self.passphrase.chars().count() < 8 {
             return Err("passphrase must be at least 8 characters".to_string());
         }
-        if self.passphrase != self.confirm_passphrase {
+        if self.passphrase.as_str() != self.confirm_passphrase.as_str() {
             return Err("passphrases do not match".to_string());
         }
         Ok(())
@@ -448,8 +457,8 @@ impl TuiApp {
     /// Generate a strong memorable passphrase and fill both fields.
     pub fn generate_passphrase(&mut self) {
         let generated = generate_passphrase();
-        self.passphrase = generated.clone();
-        self.confirm_passphrase = generated;
+        *self.passphrase = generated.clone();
+        *self.confirm_passphrase = generated;
         self.status = "generated passphrase — write it down, it cannot be recovered"
             .to_string();
     }
@@ -671,40 +680,55 @@ async fn worker_loop(
 ) {
     // Embedded Tor (arti) + SOCKS5 proxy, if requested. The proxy task
     // lives as long as the worker; aborting it shuts Tor down.
+    // In Fallback mode a failed bootstrap degrades to direct (with a
+    // visible status); in Always mode it fails closed (audit H13).
     let mut proxy_task: Option<tokio::task::JoinHandle<()>> = None;
-    let tor = match settings.tor_mode.to_mode() {
-        TorMode::Off => TorConfig::direct(),
-        mode => {
-            let _ = events.send(UiEvent::Status(
-                "bootstrapping Tor (10–60s first time)…".to_string(),
-            ));
-            match crate::tor::bootstrap_tor(&home, settings.tor_bridges).await {
-                Ok(tor_client) => {
-                    match tokio::net::TcpListener::bind(("127.0.0.1", TOR_SOCKS_PORT)).await {
-                        Ok(listener) => {
-                            proxy_task =
-                                Some(tokio::spawn(crate::tor::run_socks_proxy(
-                                    tor_client,
-                                    listener,
-                                )));
-                            TorConfig {
-                                mode,
-                                proxy_host: "127.0.0.1".to_string(),
-                                proxy_port: TOR_SOCKS_PORT,
-                            }
-                        }
-                        Err(error) => {
-                            let _ = events.send(UiEvent::Error(format!(
-                                "tor socks bind: {error}"
-                            )));
-                            return;
-                        }
+    let tor_mode = settings.tor_mode.to_mode();
+    let tor = if tor_mode == TorMode::Off {
+        TorConfig::direct()
+    } else {
+        let _ = events.send(UiEvent::Status(
+            "bootstrapping Tor (10–60s first time)…".to_string(),
+        ));
+        match crate::tor::bootstrap_tor(&home, settings.tor_bridges).await {
+            Ok(tor_client) => match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+                Ok(listener) => {
+                    let socks_port = listener
+                        .local_addr()
+                        .map(|addr| addr.port())
+                        .unwrap_or(TOR_SOCKS_PORT);
+                    proxy_task = Some(tokio::spawn(crate::tor::run_socks_proxy(
+                        tor_client,
+                        listener,
+                    )));
+                    TorConfig {
+                        mode: tor_mode,
+                        proxy_host: "127.0.0.1".to_string(),
+                        proxy_port: socks_port,
                     }
                 }
-                Err(message) => {
+                Err(error) => {
+                    if tor_mode == TorMode::Always {
+                        let _ = events.send(UiEvent::Error(format!(
+                            "tor socks bind: {error}"
+                        )));
+                        return;
+                    }
+                    let _ = events.send(UiEvent::Status(
+                        "Tor proxy unavailable — using direct (fallback)".to_string(),
+                    ));
+                    TorConfig::direct()
+                }
+            },
+            Err(message) => {
+                if tor_mode == TorMode::Always {
                     let _ = events.send(UiEvent::Error(message));
                     return;
                 }
+                let _ = events.send(UiEvent::Status(format!(
+                    "Tor unavailable ({message}) — using direct (fallback)"
+                )));
+                TorConfig::direct()
             }
         }
     };
@@ -909,15 +933,15 @@ mod tests {
     fn create_validation_rejects_bad_input() {
         let mut app = TuiApp::new();
         app.home = "/tmp/oc-tui-test-nonexistent-home".to_string();
-        app.passphrase = "short".to_string();
-        app.confirm_passphrase = "short".to_string();
+        app.passphrase = zeroize::Zeroizing::new("short".to_string());
+        app.confirm_passphrase = zeroize::Zeroizing::new("short".to_string());
         assert!(app.validate_create().is_err());
 
-        app.passphrase = "long-enough-passphrase".to_string();
-        app.confirm_passphrase = "different-passphrase".to_string();
+        app.passphrase = zeroize::Zeroizing::new("long-enough-passphrase".to_string());
+        app.confirm_passphrase = zeroize::Zeroizing::new("different-passphrase".to_string());
         assert!(app.validate_create().is_err());
 
-        app.confirm_passphrase = "long-enough-passphrase".to_string();
+        app.confirm_passphrase = zeroize::Zeroizing::new("long-enough-passphrase".to_string());
         assert!(app.validate_create().is_ok());
     }
 
@@ -926,7 +950,7 @@ mod tests {
         let mut app = TuiApp::new();
         app.generate_passphrase();
         assert!(!app.passphrase.is_empty());
-        assert_eq!(app.passphrase, app.confirm_passphrase);
+        assert_eq!(app.passphrase.as_str(), app.confirm_passphrase.as_str());
         assert!(app.validate_create().is_ok() || app.validate_create().is_err());
     }
 }

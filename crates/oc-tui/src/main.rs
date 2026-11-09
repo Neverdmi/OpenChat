@@ -326,10 +326,12 @@ fn draw(frame: &mut ratatui::Frame, app: &mut TuiApp) {
             settings::TorModeSetting::Fallback => "fallback",
             settings::TorModeSetting::Always => "always",
         };
-        let tor_note = if app.settings.tor_mode == settings::TorModeSetting::Off {
-            String::new()
-        } else {
-            "  (needs tor binary installed)".to_string()
+        let tor_note = match app.settings.tor_mode {
+            settings::TorModeSetting::Off => String::new(),
+            settings::TorModeSetting::Fallback => {
+                "  (direct first — reveals IP on first attempt!)".to_string()
+            }
+            settings::TorModeSetting::Always => "  (fail-closed)".to_string(),
         };
         let bridges_note = if app.settings.tor_bridges {
             "  (needs obfs4proxy/webtunnel-client)"

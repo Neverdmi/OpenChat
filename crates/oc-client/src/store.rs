@@ -27,10 +27,32 @@ const ARGON_T_COST: u32 = 2;
 const ARGON_P_COST: u32 = 1;
 
 /// Encrypted state file handle.
+///
+/// Holds an exclusive lock on `<dir>/.lock` for its whole lifetime so
+/// two processes cannot load the same snapshot and diverge the ratchet
+/// (audit H24).
 pub struct StateStore {
     path: PathBuf,
     salt: [u8; SALT_LEN],
     key: [u8; 32],
+    _lock: fs::File,
+}
+
+/// Acquire the per-state-directory lock (fail fast on contention).
+fn acquire_lock(dir: &Path) -> Result<fs::File> {
+    use fs2::FileExt;
+    fs::create_dir_all(dir)?;
+    let lock_path = dir.join(".lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| Error::State(format!("cannot open state lock: {error}")))?;
+    file.try_lock_exclusive()
+        .map_err(|_| Error::State("state is already open in another process".into()))?;
+    Ok(file)
 }
 
 impl core::fmt::Debug for StateStore {
@@ -80,7 +102,13 @@ impl StateStore {
 
         let salt = random_array::<SALT_LEN>();
         let key = derive_key(passphrase, &salt)?;
-        Ok(Self { path, salt, key })
+        let lock = acquire_lock(dir)?;
+        Ok(Self {
+            path,
+            salt,
+            key,
+            _lock: lock,
+        })
     }
 
     /// Open an existing encrypted state file.
@@ -103,8 +131,14 @@ impl StateStore {
         let mut salt = [0u8; SALT_LEN];
         salt.copy_from_slice(&contents[MAGIC.len()..MAGIC.len() + SALT_LEN]);
         let key = derive_key(passphrase, &salt)?;
+        let lock = acquire_lock(dir)?;
 
-        Ok(Self { path, salt, key })
+        Ok(Self {
+            path,
+            salt,
+            key,
+            _lock: lock,
+        })
     }
 
     /// Encrypted state file path.
@@ -196,11 +230,24 @@ mod tests {
     }
 
     #[test]
+    fn second_open_fails_while_locked() {
+        let dir = tempdir();
+        let store = StateStore::create(dir.path(), "passphrase").unwrap();
+        store
+            .save(&ClientState::generate(Vec::new()).unwrap())
+            .unwrap();
+        assert!(StateStore::open(dir.path(), "passphrase").is_err());
+        drop(store);
+        assert!(StateStore::open(dir.path(), "passphrase").is_ok());
+    }
+
+    #[test]
     fn state_survives_restart() {
         let dir = tempdir();
         let store = StateStore::create(dir.path(), "correct horse battery staple").unwrap();
         let state = ClientState::generate(vec!["https://relay.example".into()]).unwrap();
         store.save(&state).unwrap();
+        drop(store); // release the state lock before reopening
 
         let reopened = StateStore::open(dir.path(), "correct horse battery staple").unwrap();
         let loaded = reopened.load().unwrap();
@@ -214,6 +261,7 @@ mod tests {
         let store = StateStore::create(dir.path(), "right").unwrap();
         let state = ClientState::generate(Vec::new()).unwrap();
         store.save(&state).unwrap();
+        drop(store); // release the state lock before reopening
 
         let wrong = StateStore::open(dir.path(), "wrong").unwrap();
         assert!(matches!(wrong.load(), Err(Error::BadPassphrase)));
@@ -228,6 +276,7 @@ mod tests {
             .unwrap();
 
         let path = store.path().to_path_buf();
+        drop(store); // release the state lock before reopening
         let mut bytes = std::fs::read(&path).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
@@ -244,7 +293,9 @@ mod tests {
         store
             .save(&ClientState::generate(Vec::new()).unwrap())
             .unwrap();
+        // A second create fails (state exists and the lock is held).
         assert!(StateStore::create(dir.path(), "passphrase").is_err());
+        drop(store);
     }
 
     #[cfg(unix)]

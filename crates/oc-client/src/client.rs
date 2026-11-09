@@ -124,6 +124,8 @@ enum Processed {
 const BUNDLE_PUBLISH_INTERVAL: u64 = 300;
 /// How long to wait for a bundle when following a short invite.
 const BUNDLE_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum number of contacts (handshake-flood cap, audit H23).
+const MAX_CONTACTS: usize = 512;
 
 /// OpenChat client: encrypted state plus protocol operations.
 pub struct Client {
@@ -296,6 +298,20 @@ impl Client {
             if keys_changed && existing.verified {
                 return Err(Error::Tofu);
             }
+            if !keys_changed {
+                // Idempotent re-add (audit H21): the session already
+                // exists, a fresh handshake would only reset it.
+                return Ok(ContactSummary {
+                    peer_id: invite.peer_id,
+                    safety_number: existing.safety_number,
+                    delivered: 0,
+                    queued: false,
+                });
+            }
+        } else if self.state.contacts.len() >= MAX_CONTACTS {
+            // Cap contacts so handshake flooding cannot grow state
+            // without bound (audit H23).
+            return Err(Error::State("contact limit reached".into()));
         }
 
         let (initiation, session_key) = x3dh::initiate(&me, &bundle)?;
@@ -304,7 +320,7 @@ impl Client {
             &session_key,
             &bundle.signed_prekey,
             transcript.clone(),
-        );
+        )?;
         let mailbox_root = x3dh::mailbox_root(&session_key);
         let safety = safety_number(&my_public, &bundle.identity);
 
@@ -344,7 +360,7 @@ impl Client {
 
         self.state.upsert_contact(contact);
         self.state.add_relays(invite.relays);
-        self.state.enqueue_outbox(record.clone());
+        self.state.enqueue_outbox(record.clone())?;
         self.save()?;
         let delivered = self.try_deliver(&record, pool, fanout).await;
         self.save()?;
@@ -374,7 +390,7 @@ impl Client {
         let msg_id = body.msg_id;
         let record = self.seal_body(peer_id, &Body::Text(body), MESSAGE_TTL_SECONDS)?;
 
-        self.state.enqueue_outbox(record.clone());
+        self.state.enqueue_outbox(record.clone())?;
         self.save()?;
 
         // WebRTC direct delivery first (opt-in): if the peer's data
@@ -460,9 +476,17 @@ impl Client {
     }
 
     /// Publish one signaling message to the peer's signaling mailbox.
+    ///
+    /// Every outgoing message is signed with our identity key here —
+    /// the single egress point — so the receiver can authenticate it
+    /// against the pinned contact keys (audit H3).
     async fn publish_signaling(&self, pool: &RelayPool, peer_id: &[u8; 32], signaling: &Signaling) {
         let mailbox = mailbox::signaling_mailbox_public(peer_id);
-        let plaintext = match serde_json::to_vec(signaling) {
+        let mut signed = signaling.clone();
+        if let Ok(identity) = self.state.identity() {
+            signed.sign(&identity);
+        }
+        let plaintext = match serde_json::to_vec(&signed) {
             Ok(bytes) => bytes,
             Err(_) => return,
         };
@@ -548,7 +572,7 @@ impl Client {
         let contact = self.state.contact(peer_id).ok_or(Error::UnknownContact)?;
 
         let padded = frame::pad(&body.encode()?)?;
-        let mut ratchet = Ratchet::from_snapshot(contact.ratchet.clone())?;
+        let mut ratchet = Ratchet::from_snapshot(&contact.ratchet)?;
         let (header, ciphertext) = match ratchet.encrypt(&padded) {
             Ok(result) => result,
             Err(oc_core::Error::RatchetState) => return Err(Error::SessionNotReady),
@@ -606,11 +630,13 @@ impl Client {
             payload: record.payload.clone(),
         };
         match pool.publish(&event, fanout.max(1)).await {
-            Ok(delivered) => {
+            // Only a real acceptance removes the record; `Ok(0)` (or an
+            // error) keeps it queued with backoff (audit H22).
+            Ok(delivered) if delivered > 0 => {
                 self.state.remove_outbox(&record.peer_id, &record.msg_id);
                 delivered
             }
-            Err(_) => 0,
+            _ => 0,
         }
     }
 
@@ -815,7 +841,7 @@ impl Client {
             &Body::Ack(AckBody::new(*acked_msg_id)),
             MESSAGE_TTL_SECONDS,
         )?;
-        self.state.enqueue_outbox(record.clone());
+        self.state.enqueue_outbox(record.clone())?;
         self.save()?;
         let _ = self.try_deliver(&record, pool, fanout).await;
         self.save()?;
@@ -974,11 +1000,15 @@ impl Client {
         if sender == *peer_id {
             return Ok(Processed::Ignored);
         }
-        // Signaling is accepted only from known contacts: the sealed
-        // envelope proves the recipient, not the sender, so anyone who
-        // knows a peer id could otherwise spoof offers and harvest
-        // local IPs from our ICE candidates (audit C6).
-        if self.state.contact(&sender).is_none() {
+        // Signaling is accepted only from known contacts with a valid
+        // identity signature: the sealed envelope proves the recipient,
+        // not the sender, so anyone who knows a peer id could
+        // otherwise spoof offers and harvest local IPs from our ICE
+        // candidates (audits C6 + H3).
+        let Some(contact) = self.state.contact(&sender) else {
+            return Ok(Processed::Ignored);
+        };
+        if !signaling.verify(&contact.ed) {
             return Ok(Processed::Ignored);
         }
         // Responder sessions are created on demand (capped).
@@ -1036,11 +1066,17 @@ impl Client {
         // TOFU: a confirmed contact may not change long-term keys. An
         // unverified record produced by an earlier handshake may be replaced
         // until a ratchet message proves possession of the identity key.
+        // A fresh handshake from an already-verified contact with the
+        // same keys is ignored: replacing the session here would drop
+        // the established ratchet (audit H19).
         if let Some(existing) = self.state.contact(&peer_id) {
             let keys_changed = existing.ed != initiation.initiator.ed_bytes()
                 || existing.dh != initiation.initiator.dh_bytes();
             if keys_changed && existing.verified {
                 return Err(Error::Tofu);
+            }
+            if !keys_changed && existing.verified {
+                return Ok(Processed::Ignored);
             }
         }
 
@@ -1102,7 +1138,7 @@ impl Client {
         };
 
         let contact = self.state.contact(peer_id).ok_or(Error::UnknownContact)?;
-        let mut ratchet = Ratchet::from_snapshot(contact.ratchet.clone())?;
+        let mut ratchet = Ratchet::from_snapshot(&contact.ratchet)?;
         let padded = match ratchet.decrypt(&header, &ciphertext) {
             Ok(padded) => padded,
             Err(_) => return Ok(Processed::Ignored),

@@ -125,14 +125,19 @@ fn bundle_signing_message(
     pq_prekey: &[u8],
     created_at: u64,
 ) -> Vec<u8> {
+    // SPEC §3: signature covers `BUNDLE_DOMAIN || version || IK_sign ||
+    // IK_dh || SPK || created_at(8) || pq_len(2) || PQK` — the exact
+    // `to_bytes` layout minus the signature field itself.
     let mut message = Vec::with_capacity(64 + 32 + pq_prekey.len() + 12);
     message.extend_from_slice(BUNDLE_DOMAIN);
+    message.push(PROTOCOL_VERSION);
     message.extend_from_slice(&identity.ed_bytes());
     message.extend_from_slice(&identity.dh_bytes());
     message.extend_from_slice(signed_prekey);
-    message.extend_from_slice(&(pq_prekey.len() as u32).to_le_bytes());
-    message.extend_from_slice(pq_prekey);
     message.extend_from_slice(&created_at.to_le_bytes());
+    let pq_len = u16::try_from(pq_prekey.len()).unwrap_or(u16::MAX);
+    message.extend_from_slice(&pq_len.to_le_bytes());
+    message.extend_from_slice(pq_prekey);
     message
 }
 
@@ -259,9 +264,9 @@ pub fn initiate(me: &Identity, bundle: &PrekeyBundle) -> Result<(Initiation, [u8
     let ephemeral = StaticSecret::from(random_array::<32>());
     let ephemeral_public = PublicKey::from(&ephemeral);
 
-    let dh1 = me.dh().diffie_hellman(&responder_spk).to_bytes();
-    let dh2 = ephemeral.diffie_hellman(&bundle.identity.dh).to_bytes();
-    let dh3 = ephemeral.diffie_hellman(&responder_spk).to_bytes();
+    let dh1 = crate::dh_shared(me.dh(), &responder_spk)?;
+    let dh2 = crate::dh_shared(&ephemeral, &bundle.identity.dh)?;
+    let dh3 = crate::dh_shared(&ephemeral, &responder_spk)?;
     let (pq_ciphertext, pq_shared) = pq::encapsulate(&bundle.pq_prekey)?;
 
     let session_key =
@@ -280,12 +285,9 @@ pub fn respond(me: &Identity, prekeys: &PrekeyPair, initiation: &Initiation) -> 
     let my_public = me.public();
     let ephemeral = PublicKey::from(initiation.ephemeral);
 
-    let dh1 = prekeys
-        .signed_prekey
-        .diffie_hellman(&initiation.initiator.dh)
-        .to_bytes();
-    let dh2 = me.dh().diffie_hellman(&ephemeral).to_bytes();
-    let dh3 = prekeys.signed_prekey.diffie_hellman(&ephemeral).to_bytes();
+    let dh1 = crate::dh_shared(&prekeys.signed_prekey, &initiation.initiator.dh)?;
+    let dh2 = crate::dh_shared(me.dh(), &ephemeral)?;
+    let dh3 = crate::dh_shared(&prekeys.signed_prekey, &ephemeral)?;
     let pq_shared = prekeys.pq.decapsulate(&initiation.pq_ciphertext)?;
 
     Ok(derive_session_key(
@@ -348,6 +350,41 @@ pub fn ratchet_root(session_key: &[u8; 32]) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::Error;
+
+    #[test]
+    fn bundle_signing_layout_is_golden_locked() {
+        // Golden vector (audit H4): the signed byte layout must stay
+        // exactly `domain || version || IK_sign || IK_dh || SPK ||
+        // created_at(8) || pq_len(2) || PQK` per SPEC §3.
+        let identity_bytes = [7u8; 64];
+        let identity = Identity::from_bytes(&identity_bytes);
+        let pq = vec![9u8; 1184];
+        let bundle = PrekeyBundle {
+            identity: identity.public(),
+            signed_prekey: [3u8; 32],
+            pq_prekey: pq,
+            created_at: 1_700_000_000,
+            signature: [0u8; SIGNATURE_LEN],
+        };
+        let message = bundle.signing_message();
+        assert_eq!(
+            message.len(),
+            BUNDLE_DOMAIN.len() + 1 + 32 + 32 + 32 + 8 + 2 + 1184
+        );
+        assert!(message.starts_with(BUNDLE_DOMAIN));
+        assert_eq!(message[BUNDLE_DOMAIN.len()], PROTOCOL_VERSION);
+        // created_at (le) at fixed offset, then pq_len (le), then PQK.
+        let created_off = BUNDLE_DOMAIN.len() + 1 + 96;
+        assert_eq!(
+            &message[created_off..created_off + 8],
+            &1_700_000_000u64.to_le_bytes()
+        );
+        assert_eq!(
+            &message[created_off + 8..created_off + 10],
+            &1184u16.to_le_bytes()
+        );
+        assert!(message[created_off + 10..].iter().all(|b| *b == 9));
+    }
 
     fn handshake() -> (
         Identity,

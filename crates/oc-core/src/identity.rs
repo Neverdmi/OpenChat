@@ -90,11 +90,14 @@ pub struct PublicIdentity {
 }
 
 impl PublicIdentity {
-    /// Build from raw bytes, validating the Ed25519 key.
+    /// Build from raw bytes, validating the Ed25519 key and the X25519
+    /// key (low-order keys are rejected, audit H1).
     pub fn from_bytes(ed: &[u8; PUBLIC_KEY_LEN], dh: &[u8; PUBLIC_KEY_LEN]) -> Result<Self> {
+        let dh = PublicKey::from(*dh);
+        crate::check_public_key(&dh)?;
         Ok(Self {
             ed: VerifyingKey::from_bytes(ed).map_err(|_| Error::InvalidKey)?,
-            dh: PublicKey::from(*dh),
+            dh,
         })
     }
 

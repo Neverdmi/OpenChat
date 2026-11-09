@@ -517,8 +517,16 @@ fn resolve_peer(client: &Client, argument: &str) -> Result<[u8; 32]> {
 
 fn passphrase(confirm: bool) -> Result<Zeroizing<String>> {
     if let Ok(value) = std::env::var("OPENCHAT_PASSPHRASE") {
-        if value.is_empty() {
-            bail!("OPENCHAT_PASSPHRASE is empty");
+        // Same policy as the interactive path (audit H18), and scrub
+        // the variable from the environment so child processes and
+        // `/proc/*/environ` do not keep the passphrase around.
+        if value.len() < 8 {
+            bail!("OPENCHAT_PASSPHRASE must be at least 8 characters");
+        }
+        // SAFETY: this runs single-threaded at startup, before any
+        // worker threads or child processes exist.
+        unsafe {
+            std::env::remove_var("OPENCHAT_PASSPHRASE");
         }
         return Ok(Zeroizing::new(value));
     }

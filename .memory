@@ -2,9 +2,9 @@
 
 Обновлено: 2026-11-09
 Ветка: `main`
-Версия: 0.1.29 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.30)
+Версия: 0.1.30 (схема: 0.1.<номер коммита>; следующий коммит → 0.1.31)
 Статус: P4 почти готов (свой релей не развёрнут; default.json заполнен публичными MQTT-брокерами); P5 — CLI и TUI готовы (GUI удалён), осталась упаковка
-Тестов: 105 (+17 oc-tui, вне default-members)
+Тестов: 109 (+17 oc-tui, вне default-members)
 
 > 2026-11-09: проведён полный аудит проекта. Все находки (7 CRITICAL, ~24 HIGH,
 > ~30 MEDIUM, ~25 LOW/INFO, мёртвый код/дубль, дрейф SPEC/README) записаны в файл
@@ -96,6 +96,9 @@ openchat/
 
 ### `oc-transport`
 - `Carrier` trait: `health`, `publish`, `subscribe`, `subscribe_many`.
+- Валидация relay-URL против SSRF/downgrade (только TLS-схемы,
+  loopback-исключение для локального релея) + строгие проверки
+  срока манифеста (аудит H6–H7).
 - `RelayClient` — WebSocket, TLS через rustls + ring.
 - `socks5.rs` — SOCKS5-клиент + `TorMode` (off/fallback/always) +
   `TorConfig`; `ws.rs` — WS поверх любого стрима с ручным handshake
@@ -144,6 +147,10 @@ openchat/
 - `client.rs` — `Client::{create,open,invite,add_invite,send_text,listen_once,
   flush_outbox}`. `send_text`/`add_invite` кладут событие в outbox **до**
   публикации; `listen_once` ретраит должное, расшифровывает и шлёт ACK.
+  Подтверждённый контакт не перезаписывается повторным handshake;
+  `add_invite` идемпотентен при тех же ключах; outbox полный = ошибка,
+  не эвакуация; курсоры клампятся к now+300s (аудит H19–H23, H25).
+- State dir покрыт flock на время жизни `Client` (аудит H24).
 - `webrtc.rs` — WebRTC DataChannel (opt-in, настройка `webrtc`):
   signaling через signaling-mailbox (`HKDF(peer_id,
   "openchat/webrtc-signaling/v1")`, SPEC §9.5), ICE/STUN гугл,
@@ -246,7 +253,7 @@ cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Ожидаемо: 105 тестов. Ручная проверка релея:
+Ожидаемо: 109 тестов. Ручная проверка релея:
 
 ```bash
 cargo run -p oc-relay -- --listen 127.0.0.1:8080
